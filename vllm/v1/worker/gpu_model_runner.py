@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import os
 import gc
 import itertools
 import time
@@ -74,6 +75,7 @@ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.sample.sampler import Sampler
+from vllm.v1.spec_decode.draft_model_proposer import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -109,6 +111,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        from transformers import AutoTokenizer
+        model_name = "Qwen/Qwen3-0.6B"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -197,8 +202,11 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     vllm_config=self.vllm_config,
                     device=self.device)  # type: ignore
             else:
-                raise ValueError("Unknown speculative decoding method: "
-                                 f"{self.speculative_config.method}")
+                self.drafter = DraftModelProposer(
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                    runner=self,
+                )
             self.rejection_sampler = RejectionSampler()
 
         # Request states.
@@ -791,6 +799,23 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # TODO: Support prompt logprobs.
             logits_indices = query_start_loc[1:] - 1
             spec_decode_metadata = None
+            # Debug: baseline path positions/token mapping
+            if os.getenv("VLLM_DEBUG_SPEC_DECODE", "0") == "1":
+                try:
+                    _pos = positions_np.tolist()
+                    _li = logits_indices.detach().cpu().tolist()
+                    _li_abs = [int(_pos[i]) for i in _li]
+                    _ctx_ids = self.input_ids_cpu[:total_num_scheduled_tokens].tolist()
+                    _li_token_ids = [int(_ctx_ids[i]) for i in _li]
+                    logger.info(
+                        "SpecDecodeDebug [prepare_inputs-ref]: logits_idx=%s -> abs_positions=%s li_token_ids=%s",
+                        _li, _li_abs, _li_token_ids,
+                    )
+                except Exception as _e:
+                    logger.warning(
+                        "SpecDecodeDebug failed to log ref positions mapping: %s",
+                        _e,
+                    )
         else:
             # Get the number of draft tokens for each request.
             # Iterate over the dictionary rather than all requests since not all
@@ -804,6 +829,53 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             spec_decode_metadata = self._calc_spec_decode_metadata(
                 num_draft_tokens, cu_num_tokens)
             logits_indices = spec_decode_metadata.logits_indices
+            # Debug: show absolute positions for each logits index and map
+            # target/bonus indices through logits indices to abs positions
+            if os.getenv("VLLM_DEBUG_SPEC_DECODE", "0") == "1":
+                try:
+                    _pos = positions_np.tolist()
+                    _li = logits_indices.detach().cpu().tolist()
+                    # Map local logits indices to absolute positions
+                    _li_abs = [int(_pos[i]) for i in _li]
+                    _last_abs = int(_pos[_li[-1]]) if len(_li) > 0 else None
+                    _tli = (
+                        spec_decode_metadata.target_logits_indices.detach()
+                        .cpu().tolist()
+                    )
+                    _bli = (
+                        spec_decode_metadata.bonus_logits_indices.detach()
+                        .cpu().tolist()
+                    )
+                    _tli_abs = [int(_pos[_li[i]]) for i in _tli]
+                    _bli_abs = [int(_pos[_li[i]]) for i in _bli]
+                    # Token IDs at those absolute positions (context tokens)
+                    try:
+                        _ctx_ids = self.input_ids_cpu[:total_num_scheduled_tokens].tolist()
+                        _li_token_ids = [int(_ctx_ids[i]) for i in _li]
+                        _tli_token_ids = [int(_ctx_ids[_li[i]]) for i in _tli]
+                        _bli_token_ids = [int(_ctx_ids[_li[i]]) for i in _bli]
+                    except Exception:
+                        _li_token_ids = []
+                        _tli_token_ids = []
+                        _bli_token_ids = []
+                    logger.info(
+                        (
+                            "SpecDecodeDebug [prepare_inputs]: logits_idx=%s "
+                            "-> abs_positions=%s last_abs=%s "
+                            "target_idx=%s target_abs=%s "
+                            "bonus_idx=%s bonus_abs=%s "
+                            "li_token_ids=%s tli_token_ids=%s "
+                            "bli_token_ids=%s"
+                        ),
+                        _li, _li_abs, _last_abs, _tli, _tli_abs, _bli,
+                        _bli_abs, _li_token_ids, _tli_token_ids,
+                        _bli_token_ids,
+                    )
+                except Exception as _e:
+                    logger.warning(
+                        "SpecDecodeDebug failed to log positions mapping: %s",
+                        _e,
+                    )
 
         logits_indices_padded = None
         if self.cache_config.kv_sharing_fast_prefill:
@@ -939,6 +1011,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return (attn_metadata, logits_indices, spec_decode_metadata,
                 num_scheduled_tokens, spec_decode_common_attn_metadata,
                 max_num_scheduled_tokens)
+        
+    def dec(self, ids) -> list[str]:
+        return [self.tokenizer.decode([i]) for i in ids]
 
     def _compute_cascade_attn_prefix_len(
         self,
@@ -1142,6 +1217,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
         draft_token_ids = self.input_ids[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
+
+        # Debug instrumentation for speculative decoding indices
+        if os.getenv("VLLM_DEBUG_SPEC_DECODE", "0") == "1":
+            try:
+                _ndt = num_draft_tokens.tolist()
+                _cst = cu_num_scheduled_tokens.tolist()
+                _lli = logits_indices.detach().cpu().tolist()
+                _tli = target_logits_indices.detach().cpu().tolist()
+                _bli = bonus_logits_indices.detach().cpu().tolist()
+                _dti = draft_token_ids.detach().cpu().tolist()
+                logger.info(
+                    "SpecDecodeDebug [_calc_spec_decode_metadata]: ndraft=%s, cu_sched=%s, logits_idx=%s, target_logits_idx=%s, bonus_logits_idx=%s, draft_token_ids=%s",
+                    _ndt, _cst, _lli, _tli, _bli, _dti,
+                )
+            except Exception as _e:
+                logger.warning("SpecDecodeDebug failed to log metadata: %s", _e)
 
         metadata = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
@@ -1609,6 +1700,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            toks = self.dec(input_ids)
+            logger.info("Target.forward() on %d tokens: %s", len(toks), toks)
 
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = model_output
@@ -1659,6 +1752,26 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+            # Debug baseline path (no speculative decoding)
+            if os.getenv("VLLM_DEBUG_SPEC_DECODE", "0") == "1":
+                try:
+                    _lli = logits_indices.detach().cpu().tolist() \
+                        if isinstance(logits_indices, torch.Tensor) \
+                        else logits_indices
+                    _argi = logits.argmax(dim=-1).detach().cpu().tolist() \
+                        if logits is not None and logits.numel() > 0 else []
+                    _sampled = sampler_output.sampled_token_ids.detach() \
+                        .cpu().tolist()
+                    logger.info(
+                        "SpecDecodeDebug [execute_model-ref]: "
+                        "logits_idx=%s target_argmax=%s sampled=%s",
+                        _lli, _argi, _sampled,
+                    )
+                except Exception as _e:
+                    logger.warning(
+                        "SpecDecodeDebug failed to log execute_model-ref info: %s",
+                        _e,
+                    )
         else:
             # When indexing with a tensor (bonus_logits_indices), PyTorch
             # creates a new tensor with separate storage from the original
@@ -1676,10 +1789,64 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # separate storage from the original `logits` tensor. Therefore,
             # it is safe to update `target_logits` in place.
             target_logits = logits[spec_decode_metadata.target_logits_indices]
+            # Align spec verification with baseline greedy path by applying
+            # the same logits processing (allowed ids, bad words, non-argmax
+            # invariant processors, and penalties) before argmax.
+            target_logits_processed = target_logits.to(torch.float32)
+            target_logits_processed = self.sampler.apply_allowed_token_ids(
+                target_logits_processed, sampling_metadata)
+            target_logits_processed = self.sampler.apply_bad_words(
+                target_logits_processed, sampling_metadata)
+            for processor in (sampling_metadata.logitsprocs
+                               .non_argmax_invariant):
+                target_logits_processed = processor.apply(
+                    target_logits_processed)
+            target_logits_processed = self.sampler.apply_penalties(
+                target_logits_processed, sampling_metadata)
+
+            # Debug instrumentation: verify indices and argmax agreement in greedy
+            if os.getenv("VLLM_DEBUG_SPEC_DECODE", "0") == "1":
+                try:
+                    _all_greedy = sampling_metadata.all_greedy
+                    _all_random = sampling_metadata.all_random
+                    try:
+                        _temp = None if sampling_metadata.temperature is None else sampling_metadata.temperature.detach().cpu().tolist()
+                    except Exception:
+                        _temp = "<unavailable>"
+                    _tli = spec_decode_metadata.target_logits_indices.detach().cpu().tolist()
+                    _bli = spec_decode_metadata.bonus_logits_indices.detach().cpu().tolist()
+                    _argi = target_logits_processed.argmax(dim=-1).detach().cpu().tolist() if target_logits_processed.numel() > 0 else []
+                    _bonus_ids = bonus_token_ids.detach().cpu().tolist()
+                    logger.info(
+                        "SpecDecodeDebug [execute_model]: all_greedy=%s all_random=%s temperature=%s target_logits_idx=%s bonus_logits_idx=%s target_argmax=%s bonus_token_ids=%s",
+                        _all_greedy, _all_random, _temp, _tli, _bli, _argi, _bonus_ids,
+                    )
+                    # Also dump top-5 for target and bonus logits for the first request segment
+                    try:
+                        # Target top-k per step
+                        tk = 5
+                        if target_logits_processed.numel() > 0:
+                            topv, topi = torch.topk(target_logits_processed, k=tk, dim=-1)
+                            logger.info(
+                                "SpecDecodeDebug [target topk]: indices=%s values=%s",
+                                topi.detach().cpu().tolist(),
+                                topv.detach().cpu().tolist(),
+                            )
+                        if bonus_logits.numel() > 0:
+                            bv, bi = torch.topk(bonus_logits, k=tk, dim=-1)
+                            logger.info(
+                                "SpecDecodeDebug [bonus topk]: indices=%s values=%s",
+                                bi.detach().cpu().tolist(),
+                                bv.detach().cpu().tolist(),
+                            )
+                    except Exception as _e2:
+                        logger.warning("SpecDecodeDebug failed to log topk: %s", _e2)
+                except Exception as _e:
+                    logger.warning("SpecDecodeDebug failed to log execute_model info: %s", _e)
             output_token_ids = self.rejection_sampler(
                 spec_decode_metadata,
                 None,  # draft_probs
-                target_logits,
+                target_logits_processed,
                 bonus_token_ids,
                 sampling_metadata,
             )
@@ -1731,6 +1898,61 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampled_token_ids,
                 self.input_batch.vocab_size,
             )
+            # Debug: for spec decode, print draft vs target vs output
+            if os.getenv("VLLM_DEBUG_SPEC_DECODE", "0") == "1":
+                try:
+                    sdm = spec_decode_metadata
+                    if sdm is not None:
+                        # Per-request draft ids
+                        drafts: list[list[int]] = []
+                        start = 0
+                        for n in sdm.num_draft_tokens:
+                            end = start + n
+                            drafts.append(sdm.draft_token_ids[start:end]
+                                         .detach().cpu().tolist())
+                            start = end
+                        # Per-request target argmax (if computed)
+                        # We recompute simple argmax from the sliced logits
+                        # already prepared above when spec path ran.
+                        # If not present, leave empty lists.
+                        target_argmax_per_req: list[list[int]] = []
+                        if 'target_logits_processed' in locals():
+                            # Split by per-request num_draft_tokens
+                            start = 0
+                            for n in sdm.num_draft_tokens:
+                                end = start + n
+                                if n > 0:
+                                    tmax = (target_logits_processed[start:end]
+                                            .argmax(dim=-1)
+                                            .detach().cpu().tolist())
+                                else:
+                                    tmax = []
+                                target_argmax_per_req.append(tmax)
+                                start = end
+                        else:
+                            target_argmax_per_req = [[] for _ in drafts]
+                        # Bonus tokens per request (if any)
+                        bonus_ids = []
+                        if 'bonus_token_ids' in locals():
+                            bonus_ids = bonus_token_ids.detach().cpu().view(-1).tolist()
+                        else:
+                            bonus_ids = [None] * len(drafts)
+                        for i in range(len(valid_sampled_token_ids)):
+                            logger.info(
+                                (
+                                    "SpecDecodeDebug [outputs]: req=%d drafts=%s "
+                                    "target_argmax=%s bonus=%s output=%s"
+                                ),
+                                i,
+                                drafts[i] if i < len(drafts) else [],
+                                target_argmax_per_req[i]
+                                if i < len(target_argmax_per_req) else [],
+                                bonus_ids[i] if i < len(bonus_ids) else None,
+                                valid_sampled_token_ids[i],
+                            )
+                except Exception as _e:
+                    logger.warning(
+                        "SpecDecodeDebug failed to log spec outputs: %s", _e)
         # Mask out the sampled tokens that should not be sampled.
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
@@ -1771,6 +1993,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 aux_hidden_states,
                 spec_decode_metadata,
                 spec_decode_common_attn_metadata,
+                input_ids=input_ids,
+                positions=positions,
             )
 
         self.eplb_step()
@@ -1807,8 +2031,22 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         aux_hidden_states: Optional[torch.Tensor],
         spec_decode_metadata: Optional[SpecDecodeMetadata],
         common_attn_metadata: CommonAttentionMetadata,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor
     ) -> Union[list[list[int]], torch.Tensor]:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        if self.speculative_config.method == "draft_model":
+            assert isinstance(self.drafter, DraftModelProposer)
+            draft_token_ids = self.drafter.propose(
+                sampled_token_ids=sampled_token_ids,
+                common_attn_metadata=common_attn_metadata,
+                input_ids=input_ids,
+                positions=positions,
+                input_batch=self.input_batch,
+            )
+            toks = self.dec(draft_token_ids[0])
+            logger.info("Draft model suggested tokens: %s", toks)
+            return draft_token_ids.tolist()
         if self.speculative_config.method == "ngram":
             assert isinstance(self.drafter, NgramProposer)
             draft_token_ids = self.propose_ngram_draft_token_ids(
@@ -2401,6 +2639,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                toks = self.dec(input_ids)
+                logger.info("(Dummy Run) Target.forward() on %d tokens.", len(toks))
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
