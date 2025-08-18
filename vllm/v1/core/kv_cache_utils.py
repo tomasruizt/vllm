@@ -1023,6 +1023,85 @@ def _get_kv_cache_config_attention_free() -> KVCacheConfig:
     return KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])
 
 
+def _get_kv_cache_config_draft_model(vllm_config: VllmConfig,
+                                     kv_cache_spec: dict[str, KVCacheSpec],
+                                     available_memory: int) -> KVCacheConfig:
+    """
+    Create KV cache configuration for speculative decoding with draft models.
+    Creates separate cache groups for draft and target models.
+    """
+    
+    # Separate draft and target layer specs
+    draft_layers: list[str] = []
+    target_layers: list[str] = []
+    for layer_name in kv_cache_spec:
+        if layer_name.startswith("draft_model"): 
+            draft_layers.append(layer_name)
+        else:
+            target_layers.append(layer_name)
+    
+    grouped = [target_layers, draft_layers]
+    kv_cache_groups = create_kv_cache_group_specs(kv_cache_spec, grouped)
+    
+    # Calculate memory allocation - draft model gets less memory since it's smaller
+    draft_memory = available_memory // 4    # 25% for draft model
+    target_memory = available_memory * 3 // 4  # 75% for target model
+    
+    # Get page sizes for each group
+    if not draft_layers:
+        raise ValueError("No draft model layers found in kv_cache_spec")
+    if not target_layers:
+        raise ValueError("No target model layers found in kv_cache_spec")
+    
+    target_page_size = kv_cache_spec[target_layers[0]].page_size_bytes
+    draft_page_size = kv_cache_spec[draft_layers[0]].page_size_bytes
+    
+    # Calculate blocks for each group based on memory allocation
+    target_num_blocks = get_num_blocks(vllm_config, len(target_layers), 
+                                     target_memory, target_page_size)
+    draft_num_blocks = get_num_blocks(vllm_config, len(draft_layers),
+                                    draft_memory, draft_page_size)
+    
+    # Use the minimum to ensure both groups can fit
+    num_blocks = min(target_num_blocks, draft_num_blocks)
+    
+    # Create KV cache tensors - each layer gets its own tensor
+    kv_cache_tensors = []
+    
+    # Target model tensors
+    target_per_layer_size = target_page_size * num_blocks
+    for layer_name in target_layers:
+        kv_cache_tensors.append(
+            KVCacheTensor(size=target_per_layer_size, shared_by=[layer_name])
+        )
+    
+    # Draft model tensors  
+    draft_per_layer_size = draft_page_size * num_blocks
+    for layer_name in draft_layers:
+        kv_cache_tensors.append(
+            KVCacheTensor(size=draft_per_layer_size, shared_by=[layer_name])
+        )
+    
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=kv_cache_tensors,
+        kv_cache_groups=kv_cache_groups,
+    )
+    
+    # Log cache configuration
+    num_tokens = num_blocks * vllm_config.cache_config.block_size
+    num_tokens_str = f"{num_tokens:,}"
+    logger.info("GPU KV cache size for draft model speculative decoding: %s tokens", num_tokens_str)
+    logger.info("Draft model layers: %d, Target model layers: %d", 
+                len(draft_layers), len(target_layers))
+    max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
+    max_concurrency = get_max_concurrency_for_kv_cache_config(
+        vllm_config, kv_cache_config)
+    logger.info("Maximum concurrency for %s tokens per request: %.2fx",
+                max_model_len_str, max_concurrency)
+    
+    return kv_cache_config
+
 def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     """
     This function tries to convert the KV cache specs to one type if the model
@@ -1095,6 +1174,11 @@ def get_kv_cache_config(
     check_enough_kv_cache_memory(vllm_config, kv_cache_spec, available_memory)
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
+        
+    if (vllm_config.speculative_config and 
+        vllm_config.speculative_config.method == "draft_model"):
+        return _get_kv_cache_config_draft_model(vllm_config, kv_cache_spec, 
+                                                available_memory)
 
     if is_kv_cache_type_attention_free(kv_cache_spec):
         # This returns a kv_cache config with 0 kv_cache groups and 1 block
