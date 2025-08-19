@@ -2419,6 +2419,9 @@ class SpeculativeConfig:
 
     def use_eagle(self) -> bool:
         return self.method in ("eagle", "eagle3", "deepseek_mtp", "ernie_mtp")
+    
+    def uses_draft_model(self) -> bool:
+        return self.method == "draft_model"
 
     def __repr__(self) -> str:
         method = self.method

@@ -148,6 +148,11 @@ class Scheduler(SchedulerInterface):
             if speculative_config.use_eagle():
                 self.use_eagle = True
                 self.num_lookahead_tokens = self.num_spec_tokens
+                
+        if speculative_config:
+            uses_draft_model = speculative_config.uses_draft_model()
+        else:
+            uses_draft_model = False
 
         # Create the KV cache manager.
         self.kv_cache_manager = KVCacheManager(
@@ -155,6 +160,7 @@ class Scheduler(SchedulerInterface):
             max_model_len=self.max_model_len,
             enable_caching=self.cache_config.enable_prefix_caching,
             use_eagle=self.use_eagle,
+            use_draft_model=uses_draft_model,
             log_stats=self.log_stats,
             enable_kv_cache_events=self.enable_kv_cache_events,
         )

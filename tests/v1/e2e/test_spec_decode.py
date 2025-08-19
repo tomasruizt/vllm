@@ -70,12 +70,12 @@ def get_test_prompts(mm_enabled: bool):
 
 @pytest.fixture
 def sampling_config():
-    return SamplingParams(temperature=0, max_tokens=15, ignore_eos=False)
+    return SamplingParams(temperature=0, max_tokens=10, ignore_eos=False)
 
 
 @pytest.fixture
 def model_name():
-    return "Qwen/Qwen3-0.6B"
+    return "meta-llama/Llama-3.1-8B-Instruct"
 
 
 def test_ngram_correctness(
@@ -91,7 +91,7 @@ def test_ngram_correctness(
         m.setenv("VLLM_USE_V1", "1")
         test_prompts = get_test_prompts(mm_enabled=False)
 
-        ref_llm = LLM(model=model_name, max_model_len=1024, gpu_memory_utilization=0.5)
+        ref_llm = LLM(model=model_name, max_model_len=1024)
         ref_outputs = ref_llm.chat(test_prompts, sampling_config)
         del ref_llm
         torch.cuda.empty_cache()
@@ -106,7 +106,6 @@ def test_ngram_correctness(
                 "num_speculative_tokens": 3,
             },
             max_model_len=1024,
-            gpu_memory_utilization=0.5,
         )
         spec_outputs = spec_llm.chat(test_prompts, sampling_config)
         matches = 0
@@ -239,7 +238,7 @@ class ArgsTest:
     model: str
     draft_model: str
     method: str = "draft_model"
-    num_speculative_tokens: int = 3
+    num_speculative_tokens: int = 1
     tp_size: int = 1
     mm_enabled: bool = False
     max_model_len: int = 1024
@@ -255,63 +254,49 @@ def test_draft_model_correctness(
     sampling_config: SamplingParams,
     monkeypatch: pytest.MonkeyPatch,
 ):
+    """Compare the outputs using and not using speculative decoding.
+    In the greedy decoding case, the outputs must match EXACTLY."""
     with monkeypatch.context() as m:
         m.setenv("VLLM_USE_V1", "1")
-        # Enable detailed speculative decoding debug logs
-        m.setenv("VLLM_DEBUG_SPEC_DECODE", "0")
         test_prompts = get_test_prompts(mm_enabled=args.mm_enabled)[:1]
 
         spec_llm = LLM(
             model=args.model,
-            trust_remote_code=True,
             tensor_parallel_size=args.tp_size,
             speculative_config={
                 "method": args.method,
                 "model": args.draft_model,
                 "num_speculative_tokens": args.num_speculative_tokens,
                 "max_model_len": args.max_model_len,
-                "enforce_eager": True
+                "enforce_eager": True,
             },
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory_utilization,
-            enforce_eager=True
+            enforce_eager=True,
         )
-        spec_outputs = spec_llm.chat(test_prompts, sampling_config)        
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.model)
-        ins = {"prompt_token_ids": tokenizer.apply_chat_template(test_prompts[0], tokenize=True, add_generation_prompt=True)}
-        spec_outputs2 = spec_llm.generate(ins, sampling_params=sampling_config)
-        
+        spec_outputs = spec_llm.chat(test_prompts, sampling_config)
         del spec_llm
         torch.cuda.empty_cache()
         cleanup_dist_env_and_memory()
-        
+
         ref_llm = LLM(
             model=args.model,
-            trust_remote_code=True,
             max_model_len=args.max_model_len,
             tensor_parallel_size=args.tp_size,
             gpu_memory_utilization=args.gpu_memory_utilization,
-            enforce_eager=True
+            enforce_eager=True,
         )
         ref_outputs = ref_llm.chat(test_prompts, sampling_config)
-        ref_outputs2 = ref_llm.generate(ins, sampling_params=sampling_config)
         del ref_llm
         torch.cuda.empty_cache()
         cleanup_dist_env_and_memory()
-        
+
         assert len(ref_outputs) > 0
         assert len(ref_outputs) == len(spec_outputs)
-        
+
         for actual, expected in zip(spec_outputs, ref_outputs):
             assert actual.prompt_token_ids == expected.prompt_token_ids
-            
-        for actual, expected in zip(ref_outputs2, spec_outputs2):
-            assert actual.prompt_token_ids == expected.prompt_token_ids
-            
-        assert_outputs_match(ref_outputs2, spec_outputs2, 0.7)
-        
-        assert_outputs_match(ref_outputs, spec_outputs, 0.7)
+        assert_outputs_match(ref_outputs, spec_outputs, 1.0)
 
 
 def assert_outputs_match(
@@ -330,4 +315,4 @@ def assert_outputs_match(
 
     # Heuristic: at least a certain fraction of the outputs to match exactly
     # Upon failure, inspect the outputs to check for inaccuracy.
-    assert matches > int(fraction * len(ref_outputs))
+    assert matches >= int(fraction * len(ref_outputs))

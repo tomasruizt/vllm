@@ -276,8 +276,10 @@ def bind_kv_cache(
         layers with layer names as keys.
         runner_kv_caches: The kv_cache declared by ModelRunner.
     """
-    assert set(kv_caches.keys()) == set(forward_context.keys())
-    sorted_layers: list[str] = sorted(kv_caches.keys(), key=extract_layer_index)
+    layer_names1 = set(kv_caches.keys())
+    layer_names2 = set(forward_context.keys())
+    assert layer_names1 == layer_names2
+    sorted_layers: list[str] = sorted(layer_names1, key=extract_layer_index)
     for layer in sorted_layers:
         # NOTE: Use list because of v0 PP virtual engine.
         forward_context[layer].kv_cache = [kv_caches[layer]]

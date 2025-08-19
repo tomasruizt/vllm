@@ -806,9 +806,15 @@ def get_uniform_page_size(kv_cache_spec: dict[str, KVCacheSpec]) -> int:
     return page_sizes.pop()
 
 
+def single_group(layer_names: list[str]) -> list[list[str]]:
+    """Only a single group, no partitioning."""
+    return [layer_names]
+
+
 def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
                                       kv_cache_spec: dict[str, KVCacheSpec],
-                                      available_memory: int) -> KVCacheConfig:
+                                      available_memory: int,
+                                      partition_layers_fn = single_group) -> KVCacheConfig:
     """
     Generates the KV cache configuration for a model with one type of KV cache.
     Divide the available memory equally among all layers.
@@ -829,7 +835,8 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
     per_layer_size = page_size * num_blocks
     # All layers have the same KV cache spec, so we create one kv cache group
     # for all layers.
-    grouped_layer_names = [list(kv_cache_spec.keys())]
+    layer_names: list[str] = list(kv_cache_spec.keys())
+    grouped_layer_names: list[list[str]] = partition_layers_fn(layer_names)
 
     # Each layer uses a separate Tensor to store its KV cache.
     kv_cache_tensors = [
@@ -1023,85 +1030,6 @@ def _get_kv_cache_config_attention_free() -> KVCacheConfig:
     return KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])
 
 
-def _get_kv_cache_config_draft_model(vllm_config: VllmConfig,
-                                     kv_cache_spec: dict[str, KVCacheSpec],
-                                     available_memory: int) -> KVCacheConfig:
-    """
-    Create KV cache configuration for speculative decoding with draft models.
-    Creates separate cache groups for draft and target models.
-    """
-    
-    # Separate draft and target layer specs
-    draft_layers: list[str] = []
-    target_layers: list[str] = []
-    for layer_name in kv_cache_spec:
-        if layer_name.startswith("draft_model"): 
-            draft_layers.append(layer_name)
-        else:
-            target_layers.append(layer_name)
-    
-    grouped = [target_layers, draft_layers]
-    kv_cache_groups = create_kv_cache_group_specs(kv_cache_spec, grouped)
-    
-    # Calculate memory allocation - draft model gets less memory since it's smaller
-    draft_memory = available_memory // 4    # 25% for draft model
-    target_memory = available_memory * 3 // 4  # 75% for target model
-    
-    # Get page sizes for each group
-    if not draft_layers:
-        raise ValueError("No draft model layers found in kv_cache_spec")
-    if not target_layers:
-        raise ValueError("No target model layers found in kv_cache_spec")
-    
-    target_page_size = kv_cache_spec[target_layers[0]].page_size_bytes
-    draft_page_size = kv_cache_spec[draft_layers[0]].page_size_bytes
-    
-    # Calculate blocks for each group based on memory allocation
-    target_num_blocks = get_num_blocks(vllm_config, len(target_layers), 
-                                     target_memory, target_page_size)
-    draft_num_blocks = get_num_blocks(vllm_config, len(draft_layers),
-                                    draft_memory, draft_page_size)
-    
-    # Use the minimum to ensure both groups can fit
-    num_blocks = min(target_num_blocks, draft_num_blocks)
-    
-    # Create KV cache tensors - each layer gets its own tensor
-    kv_cache_tensors = []
-    
-    # Target model tensors
-    target_per_layer_size = target_page_size * num_blocks
-    for layer_name in target_layers:
-        kv_cache_tensors.append(
-            KVCacheTensor(size=target_per_layer_size, shared_by=[layer_name])
-        )
-    
-    # Draft model tensors  
-    draft_per_layer_size = draft_page_size * num_blocks
-    for layer_name in draft_layers:
-        kv_cache_tensors.append(
-            KVCacheTensor(size=draft_per_layer_size, shared_by=[layer_name])
-        )
-    
-    kv_cache_config = KVCacheConfig(
-        num_blocks=num_blocks,
-        kv_cache_tensors=kv_cache_tensors,
-        kv_cache_groups=kv_cache_groups,
-    )
-    
-    # Log cache configuration
-    num_tokens = num_blocks * vllm_config.cache_config.block_size
-    num_tokens_str = f"{num_tokens:,}"
-    logger.info("GPU KV cache size for draft model speculative decoding: %s tokens", num_tokens_str)
-    logger.info("Draft model layers: %d, Target model layers: %d", 
-                len(draft_layers), len(target_layers))
-    max_model_len_str = f"{vllm_config.model_config.max_model_len:,}"
-    max_concurrency = get_max_concurrency_for_kv_cache_config(
-        vllm_config, kv_cache_config)
-    logger.info("Maximum concurrency for %s tokens per request: %.2fx",
-                max_model_len_str, max_concurrency)
-    
-    return kv_cache_config
-
 def unify_hybrid_kv_cache_specs(kv_cache_spec: dict[str, KVCacheSpec]):
     """
     This function tries to convert the KV cache specs to one type if the model
@@ -1177,8 +1105,11 @@ def get_kv_cache_config(
         
     if (vllm_config.speculative_config and 
         vllm_config.speculative_config.method == "draft_model"):
-        return _get_kv_cache_config_draft_model(vllm_config, kv_cache_spec, 
-                                                available_memory)
+        return _get_kv_cache_config_uniform_type(
+            vllm_config=vllm_config, kv_cache_spec=kv_cache_spec,
+            available_memory=available_memory,
+            partition_layers_fn=split_draft_model_layers
+        )
 
     if is_kv_cache_type_attention_free(kv_cache_spec):
         # This returns a kv_cache config with 0 kv_cache groups and 1 block
@@ -1200,6 +1131,21 @@ def get_kv_cache_config(
                                                       available_memory)
 
     raise NotImplementedError
+
+
+def split_draft_model_layers(layer_names: list[str]) -> list[list[str]]:
+    return partition(layer_names, lambda layer: layer.startswith("draft_model"))
+
+
+def partition(xs: Iterable, predicate: Callable[[Any], bool]) -> tuple[list, list]:
+    yes = []
+    no = []
+    for x in xs:
+        if predicate(x):
+            yes.append(x)
+        else:
+            no.append(x)
+    return yes, no
 
 
 def unify_kv_cache_configs(kv_cache_configs: list[KVCacheConfig]):
