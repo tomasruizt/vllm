@@ -195,7 +195,7 @@ class EagleProposer:
             num_input_tokens = num_tokens
         # copy inputs to buffer for cudagraph
         self.positions[:num_tokens] = target_positions
-        self.hidden_states[:num_tokens] = target_hidden_states
+        # self.hidden_states[:num_tokens] = target_hidden_states
         if self.is_multimodal_model:
             input_ids = self.input_ids[:num_tokens]
             inputs_embeds = self.model.get_input_embeddings(
@@ -215,11 +215,11 @@ class EagleProposer:
             ret_hidden_states = self.model(
                 input_ids=input_ids,
                 positions=self.positions[:num_input_tokens],
-                hidden_states=self.hidden_states[:num_input_tokens],
-                inputs_embeds=inputs_embeds,
+                # hidden_states=self.hidden_states[:num_input_tokens],
+                # inputs_embeds=inputs_embeds,
             )
-            if self.method in ("deepseek_mtp", "ernie_mtp"):
-                last_hidden_states = ret_hidden_states
+            if self.method in ("draft_model", "deepseek_mtp", "ernie_mtp"):
+                hidden_states = last_hidden_states = ret_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
         sample_hidden_states = last_hidden_states[last_token_indices]
@@ -307,7 +307,7 @@ class EagleProposer:
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
             self.positions[:batch_size] = clamped_positions
-            self.hidden_states[:batch_size] = hidden_states
+            # self.hidden_states[:batch_size] = hidden_states
             if self.is_multimodal_model:
                 inputs_embeds = self.model.get_input_embeddings(input_ids)
                 self.inputs_embeds[:batch_size] = inputs_embeds
@@ -321,12 +321,16 @@ class EagleProposer:
             with set_forward_context(per_layer_attn_metadata,
                                      self.vllm_config,
                                      num_tokens=input_batch_size):
-                last_hidden_states, hidden_states = self.model(
+                ret_hidden_states = self.model(
                     input_ids=input_ids,
                     positions=self.positions[:input_batch_size],
-                    hidden_states=self.hidden_states[:input_batch_size],
-                    inputs_embeds=inputs_embeds,
+                    # hidden_states=self.hidden_states[:input_batch_size],
+                    # inputs_embeds=inputs_embeds,
                 )
+            if self.method in ("draft_model", "deepseek_mtp", "ernie_mtp"):
+                hidden_states = last_hidden_states = ret_hidden_states
+            else:
+                last_hidden_states, hidden_states = ret_hidden_states
             hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size],
                                                None)
@@ -610,8 +614,13 @@ class EagleProposer:
 
         from vllm.compilation.backends import set_model_tag
         with set_model_tag("eagle_head"):
-            self.model = get_model(vllm_config=self.vllm_config,
-                                   model_config=draft_model_config)
+            vllm_config_draft = replace(
+                self.vllm_config,
+                model_config=draft_model_config
+            )
+            self.model = get_model(vllm_config=vllm_config_draft,
+                                   model_config=draft_model_config,
+                                   prefix="draft_model")
 
         draft_attn_layer_names = (
             get_layers_from_vllm_config(self.vllm_config, Attention).keys() -
@@ -645,6 +654,7 @@ class EagleProposer:
         # some model definition do not define lm_head explicitly
         # and reuse embed_tokens for lm_head, e.g., CohereForCausalLM
         if self.vllm_config.speculative_config.method != "eagle3" and \
+            not self.vllm_config.speculative_config.uses_draft_model() and \
                 hasattr(target_language_model, "lm_head"):
             logger.info("Loading EAGLE LM head weights from the target model.")
             self.model.lm_head = target_language_model.lm_head

@@ -15,14 +15,14 @@ def test_bind_kv_cache():
 
     ctx = {
         'layers.0.self_attn': Attention(32, 128, 0.1),
+        'layers.1.self_attn': Attention(32, 128, 0.1),
         'layers.2.self_attn': Attention(32, 128, 0.1),
         'layers.3.self_attn': Attention(32, 128, 0.1),
-        'layers.1.self_attn': Attention(32, 128, 0.1),
     }
     kv_cache = {
-        'layers.2.self_attn': torch.zeros((1, )),
         'layers.0.self_attn': torch.zeros((1, )),
         'layers.1.self_attn': torch.zeros((1, )),
+        'layers.2.self_attn': torch.zeros((1, )),
         'layers.3.self_attn': torch.zeros((1, )),
     }
     runner_kv_caches: list[torch.Tensor] = []
