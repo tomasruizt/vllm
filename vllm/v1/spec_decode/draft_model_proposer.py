@@ -24,7 +24,7 @@ class DraftModelProposer:
         vllm_config: VllmConfig,
         device: torch.device,
         # FIXME: The runner is only used to build attention metadata for drafting
-        # Ideally there is an easier way to build this without accessing the full runner. 
+        # Ideally there is an easier way to build this without accessing the full runner.
         runner: "GPUModelRunner",
     ):
         self.vllm_config = vllm_config
@@ -120,7 +120,12 @@ class DraftModelProposer:
             ),
             num_reqs=flat_inputs.num_reqs(),
             num_actual_tokens=flat_inputs.num_tokens(),
+            # NOTE: For draft models, we process the entire sequence as "query"
+            # to generate the next token, so max_query_len equals max_seq_len.
+            # This is different from the main model which typically only
+            # processes new tokens in decode phase.
             max_query_len=max(flat_inputs.seq_lens_cpu),
+            max_seq_len=max(flat_inputs.seq_lens_cpu),
             block_table_tensor=blk_table_tensor,
             slot_mapping=slot_mapping,
             causal=True,
@@ -173,13 +178,24 @@ class FlatInputs:
 
 
 def to_flat_inputs(input_batch: InputBatch) -> FlatInputs:
+    """
+    Prepares inputs for draft model inference.
+    
+    For draft models, we process the entire sequence (prompt + all generated 
+    tokens) to predict the next token. This is different from the main model 
+    which typically only processes new tokens in decode phase.
+    
+    Returns FlatInputs where seq_lens_cpu contains the full sequence lengths,
+    and query_start_loc reflects processing the entire sequences as "queries".
+    """
     input_ids_list: list[torch.Tensor] = []
     positions_list: list[torch.Tensor] = []
     seq_lens: list[int] = []
 
     req_idxs = [input_batch.req_id_to_index[i] for i in input_batch.req_ids]
     for req_idx in req_idxs:
-        # Get the full sequence including the newly sampled token
+        # Get the full sequence including all generated tokens 
+        # (no speculative tokens)
         base_len = input_batch.num_tokens_no_spec[req_idx]
         seq_ids_np = input_batch.token_ids_cpu[req_idx, :base_len]
         seq_ids = torch.from_numpy(seq_ids_np).to(dtype=torch.int32)
