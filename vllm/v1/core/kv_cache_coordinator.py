@@ -377,9 +377,39 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         return hit_blocks, hit_length
 
 
+class DraftModelKVCacheCoordinator(KVCacheCoordinator):
+    """KV cache coordinator for speculative decoding with draft model."""
+
+    def find_longest_cache_hit(
+        self,
+        block_hashes: list[BlockHash],
+        max_cache_hit_length: int,
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:
+        groups = self.kv_cache_config.kv_cache_groups
+        managers = self.single_type_managers
+        # Each internal manager must query its own KV cache group id???
+        res1, res2 = [
+            manager.find_longest_cache_hit(
+                block_hashes=block_hashes,
+                max_length=max_cache_hit_length,
+                kv_cache_group_ids=[i],
+                block_pool=self.block_pool,
+                kv_cache_spec=group.kv_cache_spec,
+                use_eagle=self.use_eagle,
+            )
+            for i, (group, manager) in enumerate(zip(groups, managers))
+        ]
+        blocks = res1 + res2
+        num_blocks = min(len(blocks[0]), len(blocks[1])) * self.block_size()
+        return blocks, num_blocks
+
+    def block_size(self) -> int:
+        return self.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
+
+
 def get_kv_cache_coordinator(
         kv_cache_config: KVCacheConfig, max_model_len: int, use_eagle: bool,
-        enable_caching: bool,
+        use_draft_model: bool, enable_caching: bool,
         enable_kv_cache_events: bool) -> KVCacheCoordinator:
     if not enable_caching:
         return KVCacheCoordinatorNoPrefixCache(kv_cache_config, max_model_len,
@@ -389,5 +419,15 @@ def get_kv_cache_coordinator(
         return UnitaryKVCacheCoordinator(kv_cache_config, max_model_len,
                                          use_eagle, enable_caching,
                                          enable_kv_cache_events)
+    
+    if use_draft_model:
+        return DraftModelKVCacheCoordinator(
+            kv_cache_config=kv_cache_config,
+            max_model_len=max_model_len,
+            use_eagle=use_eagle,
+            enable_caching=enable_caching,
+            enable_kv_cache_events=enable_kv_cache_events,
+        )
+    
     return HybridKVCacheCoordinator(kv_cache_config, max_model_len, use_eagle,
                                     enable_caching, enable_kv_cache_events)

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
+from dataclasses import dataclass
 import random
 from typing import Any, Union
 
@@ -230,3 +231,88 @@ def test_eagle_correctness(
         del spec_llm
         torch.cuda.empty_cache()
         cleanup_dist_env_and_memory()
+
+
+@dataclass
+class ArgsTest:
+    model: str
+    draft_model: str
+    method: str = "draft_model"
+    num_speculative_tokens: int = 1
+    tp_size: int = 1
+    mm_enabled: bool = False
+    max_model_len: int = 1024
+    gpu_memory_utilization: float = 0.5
+
+cases = [
+    ArgsTest("Qwen/Qwen3-0.6B", draft_model="Qwen/Qwen3-0.6B"),
+]
+
+@pytest.mark.parametrize("args", cases)
+def test_draft_model_correctness(
+    args: ArgsTest,
+    sampling_config: SamplingParams,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Compare the outputs using and not using speculative decoding.
+    In the greedy decoding case, the outputs must match EXACTLY."""
+    with monkeypatch.context() as m:
+        m.setenv("VLLM_USE_V1", "1")
+        test_prompts = get_test_prompts(mm_enabled=args.mm_enabled)[:1]
+
+        spec_llm = LLM(
+            model=args.model,
+            tensor_parallel_size=args.tp_size,
+            speculative_config={
+                "method": args.method,
+                "model": args.draft_model,
+                "num_speculative_tokens": args.num_speculative_tokens,
+                "max_model_len": args.max_model_len,
+                "enforce_eager": True,
+            },
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=True,
+        )
+        spec_outputs = spec_llm.chat(test_prompts, sampling_config)
+        del spec_llm
+        torch.cuda.empty_cache()
+        cleanup_dist_env_and_memory()
+
+        ref_llm = LLM(
+            model=args.model,
+            max_model_len=args.max_model_len,
+            tensor_parallel_size=args.tp_size,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=True,
+        )
+        ref_outputs = ref_llm.chat(test_prompts, sampling_config)
+        del ref_llm
+        torch.cuda.empty_cache()
+        cleanup_dist_env_and_memory()
+
+        assert len(ref_outputs) > 0
+        assert len(ref_outputs) == len(spec_outputs)
+
+        for actual, expected in zip(spec_outputs, ref_outputs):
+            assert actual.prompt_token_ids == expected.prompt_token_ids
+        assert_outputs_match(ref_outputs, spec_outputs, 1.0)
+
+
+def assert_outputs_match(
+    ref_outputs: list[str], spec_outputs: list[str], fraction: float
+):
+    """Assert that at least "fraction" of the prompts match exactly"""
+    matches = 0
+    misses = 0
+    for ref_output, spec_output in zip(ref_outputs, spec_outputs):
+        if ref_output.outputs[0].text == spec_output.outputs[0].text:
+            matches += 1
+        else:
+            misses += 1
+            print(f"ref_output: {ref_output.outputs[0].text}")
+            print(f"spec_output: {spec_output.outputs[0].text}")
+
+    # Heuristic: at least a certain fraction of the outputs to match exactly
+    # Upon failure, inspect the outputs to check for inaccuracy.
+    assert matches >= int(fraction * len(ref_outputs))

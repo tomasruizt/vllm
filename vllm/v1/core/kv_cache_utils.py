@@ -806,9 +806,15 @@ def get_uniform_page_size(kv_cache_spec: dict[str, KVCacheSpec]) -> int:
     return page_sizes.pop()
 
 
+def single_group(layer_names: list[str]) -> list[list[str]]:
+    """Only a single group, no partitioning."""
+    return [layer_names]
+
+
 def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
                                       kv_cache_spec: dict[str, KVCacheSpec],
-                                      available_memory: int) -> KVCacheConfig:
+                                      available_memory: int,
+                                      partition_layers_fn = single_group) -> KVCacheConfig:
     """
     Generates the KV cache configuration for a model with one type of KV cache.
     Divide the available memory equally among all layers.
@@ -829,7 +835,8 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
     per_layer_size = page_size * num_blocks
     # All layers have the same KV cache spec, so we create one kv cache group
     # for all layers.
-    grouped_layer_names = [list(kv_cache_spec.keys())]
+    layer_names: list[str] = list(kv_cache_spec.keys())
+    grouped_layer_names: list[list[str]] = partition_layers_fn(layer_names)
 
     # Each layer uses a separate Tensor to store its KV cache.
     kv_cache_tensors = [
@@ -1095,6 +1102,14 @@ def get_kv_cache_config(
     check_enough_kv_cache_memory(vllm_config, kv_cache_spec, available_memory)
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
+        
+    if (vllm_config.speculative_config and 
+        vllm_config.speculative_config.method == "draft_model"):
+        return _get_kv_cache_config_uniform_type(
+            vllm_config=vllm_config, kv_cache_spec=kv_cache_spec,
+            available_memory=available_memory,
+            partition_layers_fn=split_draft_model_layers
+        )
 
     if is_kv_cache_type_attention_free(kv_cache_spec):
         # This returns a kv_cache config with 0 kv_cache groups and 1 block
@@ -1116,6 +1131,21 @@ def get_kv_cache_config(
                                                       available_memory)
 
     raise NotImplementedError
+
+
+def split_draft_model_layers(layer_names: list[str]) -> list[list[str]]:
+    return partition(layer_names, lambda layer: layer.startswith("draft_model"))
+
+
+def partition(xs: Iterable, predicate: Callable[[Any], bool]) -> tuple[list, list]:
+    yes = []
+    no = []
+    for x in xs:
+        if predicate(x):
+            yes.append(x)
+        else:
+            no.append(x)
+    return yes, no
 
 
 def unify_kv_cache_configs(kv_cache_configs: list[KVCacheConfig]):
