@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from importlib.util import find_spec
 from typing import Optional, Protocol
 
@@ -42,12 +42,6 @@ class EagleAttentionMetadata(Protocol):
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
-
-
-@dataclass
-class Proposal:
-    token_ids: torch.Tensor
-    log_probs: Optional[torch.Tensor]
 
 
 class EagleProposer:
@@ -164,7 +158,7 @@ class EagleProposer:
         common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
         mm_embeds: Optional[list[torch.Tensor]] = None,
-    ) -> Proposal:
+    ) -> torch.Tensor:
         num_tokens = target_token_ids.shape[0]
         batch_size = next_token_ids.shape[0]
         last_token_indices = common_attn_metadata.query_start_loc[1:] - 1
@@ -181,13 +175,6 @@ class EagleProposer:
         # Replace the last token with the next token.
         # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
         self.input_ids[last_token_indices] = next_token_ids
-
-        return_log_probs = not sampling_metadata.all_greedy
-        if not return_log_probs:
-            log_probs = None
-        else:
-            log_probs = torch.empty((batch_size, self.num_speculative_tokens),
-                                    device=self.runner.device)
 
         assert self.runner is not None
 
@@ -250,22 +237,14 @@ class EagleProposer:
                 common_attn_metadata=common_attn_metadata,
             )
             # [batch_size, num_tree_tokens]
-            return Proposal(
-                token_ids=torch.cat(draft_token_ids_list, dim=1),
-                # FIXME: Implement log_probs for tree attention
-                log_probs=None)
+            return torch.cat(draft_token_ids_list, dim=1)
 
-        only_sampled_token = 0
-        sampler_out = self.runner.sampler(
-            logits,
-            replace(sampling_metadata, max_num_logprobs=only_sampled_token))
-        draft_token_ids = sampler_out.sampled_token_ids.flatten()
+        draft_token_ids = logits.argmax(dim=-1)
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
             # [batch_size, 1]
-            return Proposal(token_ids=draft_token_ids.view(-1, 1),
-                            log_probs=log_probs)
+            return draft_token_ids.view(-1, 1)
 
         # TODO: Currently, MTP module released by deepseek only has
         # one layer. Adapt this code to support multiple layers once
@@ -274,9 +253,6 @@ class EagleProposer:
 
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
-        if return_log_probs:
-            assert log_probs is not None
-            log_probs[:, 0] = sampler_out.logprobs_tensors.logprobs.flatten()
 
         if self.use_cuda_graph and \
                 batch_size <= self.cudagraph_batch_sizes[-1]:
@@ -358,21 +334,12 @@ class EagleProposer:
             hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size],
                                                None)
-            sampler_out = self.runner.sampler(
-                logits,
-                replace(sampling_metadata,
-                        max_num_logprobs=only_sampled_token))
-            draft_token_ids = sampler_out.sampled_token_ids.flatten()
-            if return_log_probs:
-                assert log_probs is not None
-                new_logprobs = sampler_out.logprobs_tensors.logprobs.flatten()
-                log_probs[:, idx] = new_logprobs
+            draft_token_ids = logits.argmax(dim=-1)
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
-
-        return Proposal(token_ids=draft_token_ids, log_probs=log_probs)
+        return draft_token_ids
 
     def propose_tree(
         self,
