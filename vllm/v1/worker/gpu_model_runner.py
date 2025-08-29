@@ -110,6 +110,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        # FIXME: Logging the tokens is only for development,
+        # it will be removed once the feature is complete.
+        self.log_toks = False
+        if self.log_toks:
+            from transformers import AutoTokenizer
+            model_name = "Qwen/Qwen3-0.6B"
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -191,7 +198,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if self.speculative_config and get_pp_group().is_last_rank:
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
-            elif self.speculative_config.use_eagle():
+            elif (self.speculative_config.use_eagle()
+                  or self.speculative_config.uses_draft_model()):
                 self.drafter = EagleProposer(self.vllm_config, self.device,
                                              self)  # type: ignore
                 if self.speculative_config.method == "eagle3":
@@ -916,6 +924,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_scheduled_tokens, spec_decode_common_attn_metadata,
                 max_num_scheduled_tokens)
 
+    def dec(self, ids) -> list[str]:
+        return [self.tokenizer.decode([i]) for i in ids]
+
     def _compute_cascade_attn_prefix_len(
         self,
         num_scheduled_tokens: np.ndarray,
@@ -1475,6 +1486,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+        if self.log_toks:
+            logger.info("======STEP=======")
         self._update_states(scheduler_output)
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
@@ -1585,6 +1598,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            if self.log_toks:
+                toks = self.dec(input_ids)
+                logger.info("Target.forward() on %d tokens: %s", len(toks),
+                            toks)
 
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = model_output
@@ -1652,6 +1669,10 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # separate storage from the original `logits` tensor. Therefore,
             # it is safe to update `target_logits` in place.
             target_logits = logits[spec_decode_metadata.target_logits_indices]
+            if self.log_toks:
+                toks = self.dec(target_logits.argmax(dim=-1))
+                logger.info("Target greedy tokens: %s", toks)
+
             output_token_ids = self.rejection_sampler(
                 spec_decode_metadata,
                 None,  # draft_probs
@@ -1660,6 +1681,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampling_metadata,
             )
             sampler_output.sampled_token_ids = output_token_ids
+            if self.log_toks:
+                toks = self.dec(output_token_ids[0][output_token_ids[0] != -1])
+                logger.info("Rejection sampler chose tokens: %s", toks)
 
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -1748,6 +1772,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 spec_decode_metadata,
                 spec_decode_common_attn_metadata,
             )
+            if self.log_toks:
+                toks = self.dec(self._draft_token_ids[0])
+                logger.info("Draft model suggested tokens: %s", toks)
 
         self.eplb_step()
 
@@ -1809,7 +1836,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 target_hidden_states=hidden_states,
                 sampling_metadata=sampling_metadata,
             )
-        elif self.speculative_config.use_eagle():
+        elif self.speculative_config.use_eagle(
+        ) or self.speculative_config.method == "draft_model":
             assert isinstance(self.drafter, EagleProposer)
             # TODO(woosuk): Refactor the loop.
             req_ids = self.input_batch.req_ids
@@ -2380,14 +2408,18 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     inputs_embeds=inputs_embeds,
                     **model_kwargs,
                 )
+                if self.log_toks:
+                    toks = self.dec(input_ids)
+                    logger.info("(Dummy Run) Target.forward() on %d tokens.",
+                                len(toks))
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and self.speculative_config.use_eagle():
-                assert isinstance(self.drafter, EagleProposer)
+            if self.speculative_config and isinstance(self.drafter,
+                                                      EagleProposer):
                 self.drafter.dummy_run(num_tokens)
 
         # This is necessary to avoid blocking DP.

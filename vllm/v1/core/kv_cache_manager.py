@@ -89,6 +89,7 @@ class KVCacheManager:
         max_model_len: int,
         enable_caching: bool = True,
         use_eagle: bool = False,
+        use_draft_model: bool = False,
         log_stats: bool = False,
         enable_kv_cache_events: bool = False,
     ) -> None:
@@ -96,6 +97,7 @@ class KVCacheManager:
 
         self.enable_caching = enable_caching
         self.use_eagle = use_eagle
+        self.use_draft_model = use_draft_model
         self.log_stats = log_stats
         # FIXME: make prefix cache stats conditional on log_stats
         self.prefix_cache_stats = PrefixCacheStats() if log_stats else None
@@ -113,6 +115,7 @@ class KVCacheManager:
             kv_cache_config=kv_cache_config,
             max_model_len=self.max_model_len,
             use_eagle=self.use_eagle,
+            use_draft_model=self.use_draft_model,
             enable_caching=self.enable_caching,
             enable_kv_cache_events=enable_kv_cache_events,
         )
