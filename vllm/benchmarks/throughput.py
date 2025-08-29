@@ -39,6 +39,7 @@ def run_vllm(
     requests: list[SampleRequest],
     n: int,
     engine_args: EngineArgs,
+    do_profile: bool,
     disable_detokenize: bool = False,
 ) -> "Results":
     from vllm import LLM, SamplingParams
@@ -76,12 +77,16 @@ def run_vllm(
 
     outputs = None
     if not use_beam_search:
+        if do_profile:
+            llm.start_profile()
         start = time.perf_counter()
         outputs = llm.generate(prompts,
                                sampling_params,
                                lora_request=lora_requests,
                                use_tqdm=True)
         end = time.perf_counter()
+        if do_profile:
+            llm.stop_profile()
     else:
         assert lora_requests is None, "BeamSearch API does not support LoRA"
         prompts = [request.prompt for request in requests]
@@ -559,6 +564,10 @@ def add_cli_args(parser: argparse.ArgumentParser):
                         type=str,
                         default=None,
                         help="Split of the HF dataset.")
+    parser.add_argument("--profile",
+                        action="store_true",
+                        default=False,
+                        help="Profile the model.")
 
     # prefix repetition dataset
     prefix_repetition_group = parser.add_argument_group(
@@ -622,7 +631,8 @@ def main(args: argparse.Namespace):
         else:
             bresults = run_vllm(
                 requests, args.n, EngineArgs.from_cli_args(args),
-                args.disable_detokenize)
+                do_profile=args.profile,
+                disable_detokenize=args.disable_detokenize)
             elapsed_time = bresults.runtime
             request_outputs = bresults.outputs
     elif args.backend == "hf":
