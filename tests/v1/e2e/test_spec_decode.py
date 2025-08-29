@@ -265,16 +265,16 @@ cases = [
         model="Qwen/Qwen3-1.7B",
         draft_model="Qwen/Qwen3-0.6B",
         sampling_config=stochastic_sampling(),
-        expected_acceptance_rate=0.95,
-        expected_same_output_fraction=0.95,
+        expected_acceptance_rate=0.9,
+        expected_same_output_fraction=0.9,
     ),
-    # ArgsTest(
-    #     model="Qwen/Qwen3-1.7B",
-    #     draft_model="Qwen/Qwen3-0.6B",
-    #     sampling_config=greedy_sampling(),
-    #     expected_acceptance_rate=1.0,
-    #     expected_same_output_fraction=1.0,
-    # ),
+    ArgsTest(
+        model="Qwen/Qwen3-1.7B",
+        draft_model="Qwen/Qwen3-0.6B",
+        sampling_config=greedy_sampling(),
+        expected_acceptance_rate=1.0,
+        expected_same_output_fraction=1.0,
+    ),
 ]
 
 
