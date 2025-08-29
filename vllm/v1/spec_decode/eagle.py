@@ -262,7 +262,7 @@ class EagleProposer:
         attn_metadata.num_actual_tokens = batch_size
         attn_metadata.max_query_len = 1
         attn_metadata.query_start_loc = self.arange[:batch_size + 1]
-        for idx in range(1, self.num_speculative_tokens):
+        for _ in range(self.num_speculative_tokens - 1):
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
@@ -331,7 +331,7 @@ class EagleProposer:
                 hidden_states = last_hidden_states = ret_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
-            hidden_states = hidden_states[:batch_size]
+            # hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size],
                                                None)
             draft_token_ids = logits.argmax(dim=-1)
@@ -666,16 +666,16 @@ class EagleProposer:
                                  num_tokens=num_tokens):
             if self.is_multimodal_model:
                 input_ids = None
-                inputs_embeds = self.inputs_embeds[:num_tokens]
+                # inputs_embeds = self.inputs_embeds[:num_tokens]
             else:
                 input_ids = self.input_ids[:num_tokens]
-                inputs_embeds = None
+                # inputs_embeds = None
 
             self.model(
                 input_ids=input_ids,
                 positions=self.positions[:num_tokens],
-                hidden_states=self.hidden_states[:num_tokens],
-                inputs_embeds=inputs_embeds,
+                # hidden_states=self.hidden_states[:num_tokens],
+                # inputs_embeds=inputs_embeds,
             )
 
     def validate_same_kv_cache_group(self,

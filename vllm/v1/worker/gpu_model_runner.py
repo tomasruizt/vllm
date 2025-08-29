@@ -2418,8 +2418,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and self.speculative_config.use_eagle():
-                assert isinstance(self.drafter, EagleProposer)
+            if self.speculative_config and isinstance(self.drafter,
+                                                      EagleProposer):
                 self.drafter.dummy_run(num_tokens)
 
         # This is necessary to avoid blocking DP.
