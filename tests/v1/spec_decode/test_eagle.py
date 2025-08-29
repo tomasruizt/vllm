@@ -373,7 +373,7 @@ def test_propose(method, attn_backend, num_speculative_tokens, monkeypatch):
                               common_attn_metadata=common_attn_metadata,
                               sampling_metadata=sampling_metadata)
 
-    assert result.shape == (batch_size, num_speculative_tokens)
+    assert result.token_ids.shape == (batch_size, num_speculative_tokens)
 
     # Create expected tokens based on our token pattern
     if num_speculative_tokens == 1:
@@ -392,7 +392,7 @@ def test_propose(method, attn_backend, num_speculative_tokens, monkeypatch):
                 expected_tokens[i, j] = base_token_ids[i] + j
 
     # Verify all tokens match our expectations
-    assert torch.equal(result, expected_tokens)
+    assert torch.equal(result.token_ids, expected_tokens)
 
 
 @pytest.mark.parametrize(
@@ -523,7 +523,7 @@ def test_propose_tree(spec_token_tree):
                               next_token_ids=next_token_ids,
                               common_attn_metadata=common_attn_metadata,
                               sampling_metadata=sampling_metadata)
-    assert result.shape == (batch_size, num_speculative_tokens)
+    assert result.token_ids.shape == (batch_size, num_speculative_tokens)
 
     # The tokens are expected to be consecutive integers starting
     # from the base token IDs.
@@ -531,4 +531,4 @@ def test_propose_tree(spec_token_tree):
         num_speculative_tokens, dtype=torch.int64, device=device)
 
     # Verify that the draft tokens match our expectations.
-    assert torch.equal(result, expected_tokens)
+    assert torch.equal(result.token_ids, expected_tokens)
