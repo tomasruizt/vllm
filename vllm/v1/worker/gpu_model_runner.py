@@ -110,7 +110,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         vllm_config: VllmConfig,
         device: torch.device,
     ):
-        # FIXME: Logging the tokens is only for development, 
+        # FIXME: Logging the tokens is only for development,
         # it will be removed once the feature is complete.
         self.log_toks = False
         if self.log_toks:
@@ -198,7 +198,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         if self.speculative_config and get_pp_group().is_last_rank:
             if self.speculative_config.method == "ngram":
                 self.drafter = NgramProposer(self.vllm_config)
-            elif (self.speculative_config.use_eagle() 
+            elif (self.speculative_config.use_eagle()
                   or self.speculative_config.uses_draft_model()):
                 self.drafter = EagleProposer(self.vllm_config, self.device,
                                              self)  # type: ignore
@@ -923,7 +923,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         return (attn_metadata, logits_indices, spec_decode_metadata,
                 num_scheduled_tokens, spec_decode_common_attn_metadata,
                 max_num_scheduled_tokens)
-        
+
     def dec(self, ids) -> list[str]:
         return [self.tokenizer.decode([i]) for i in ids]
 
@@ -1600,7 +1600,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             )
             if self.log_toks:
                 toks = self.dec(input_ids)
-                logger.info("Target.forward() on %d tokens: %s", len(toks), toks)
+                logger.info("Target.forward() on %d tokens: %s", len(toks),
+                            toks)
 
         if self.use_aux_hidden_state_outputs:
             hidden_states, aux_hidden_states = model_output
@@ -1671,7 +1672,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             if self.log_toks:
                 toks = self.dec(target_logits.argmax(dim=-1))
                 logger.info("Target greedy tokens: %s", toks)
-            
+
             output_token_ids = self.rejection_sampler(
                 spec_decode_metadata,
                 None,  # draft_probs
@@ -1835,7 +1836,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 target_hidden_states=hidden_states,
                 sampling_metadata=sampling_metadata,
             )
-        elif self.speculative_config.use_eagle() or self.speculative_config.method == "draft_model":
+        elif self.speculative_config.use_eagle(
+        ) or self.speculative_config.method == "draft_model":
             assert isinstance(self.drafter, EagleProposer)
             # TODO(woosuk): Refactor the loop.
             req_ids = self.input_batch.req_ids
@@ -2408,7 +2410,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
                 if self.log_toks:
                     toks = self.dec(input_ids)
-                    logger.info("(Dummy Run) Target.forward() on %d tokens.", len(toks))
+                    logger.info("(Dummy Run) Target.forward() on %d tokens.",
+                                len(toks))
 
             if self.use_aux_hidden_state_outputs:
                 hidden_states, _ = outputs

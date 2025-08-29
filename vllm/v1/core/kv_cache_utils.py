@@ -6,7 +6,7 @@ import os
 from collections import defaultdict, deque
 from collections.abc import Iterable, Sequence
 from dataclasses import astuple, dataclass
-from typing import Any, Callable, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional, TypeVar
 
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
@@ -811,10 +811,11 @@ def single_group(layer_names: list[str]) -> list[list[str]]:
     return [layer_names]
 
 
-def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
-                                      kv_cache_spec: dict[str, KVCacheSpec],
-                                      available_memory: int,
-                                      partition_layers_fn = single_group) -> KVCacheConfig:
+def _get_kv_cache_config_uniform_type(
+        vllm_config: VllmConfig,
+        kv_cache_spec: dict[str, KVCacheSpec],
+        available_memory: int,
+        partition_layers_fn=single_group) -> KVCacheConfig:
     """
     Generates the KV cache configuration for a model with one type of KV cache.
     Divide the available memory equally among all layers.
@@ -1102,14 +1103,14 @@ def get_kv_cache_config(
     check_enough_kv_cache_memory(vllm_config, kv_cache_spec, available_memory)
     if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
         unify_hybrid_kv_cache_specs(kv_cache_spec)
-        
-    if (vllm_config.speculative_config and 
-        vllm_config.speculative_config.uses_draft_model()):
+
+    if (vllm_config.speculative_config
+            and vllm_config.speculative_config.uses_draft_model()):
         return _get_kv_cache_config_uniform_type(
-            vllm_config=vllm_config, kv_cache_spec=kv_cache_spec,
+            vllm_config=vllm_config,
+            kv_cache_spec=kv_cache_spec,
             available_memory=available_memory,
-            partition_layers_fn=split_draft_model_layers
-        )
+            partition_layers_fn=split_draft_model_layers)
 
     if is_kv_cache_type_attention_free(kv_cache_spec):
         # This returns a kv_cache config with 0 kv_cache groups and 1 block
@@ -1134,10 +1135,16 @@ def get_kv_cache_config(
 
 
 def split_draft_model_layers(layer_names: list[str]) -> list[list[str]]:
-    return partition(layer_names, lambda layer: layer.startswith("draft_model"))
+    yes, no = partition(layer_names,
+                        lambda layer: layer.startswith("draft_model"))
+    return [yes, no]
 
 
-def partition(xs: Iterable, predicate: Callable[[Any], bool]) -> tuple[list, list]:
+T = TypeVar("T")
+
+
+def partition(xs: Iterable[T],
+              predicate: Callable[[T], bool]) -> tuple[list[T], list[T]]:
     yes = []
     no = []
     for x in xs:

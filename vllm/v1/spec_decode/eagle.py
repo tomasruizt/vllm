@@ -614,10 +614,8 @@ class EagleProposer:
 
         from vllm.compilation.backends import set_model_tag
         with set_model_tag("eagle_head"):
-            vllm_config_draft = replace(
-                self.vllm_config,
-                model_config=draft_model_config
-            )
+            vllm_config_draft = replace(self.vllm_config,
+                                        model_config=draft_model_config)
             self.model = get_model(vllm_config=vllm_config_draft,
                                    model_config=draft_model_config,
                                    prefix="draft_model")

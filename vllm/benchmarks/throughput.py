@@ -10,7 +10,6 @@ import time
 import warnings
 from typing import Any, Optional, Union
 
-from prometheus_client import Metric
 import torch
 import uvloop
 from tqdm import tqdm
@@ -32,6 +31,7 @@ from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import BeamSearchParams
 from vllm.utils import merge_async_iterators
+from vllm.v1.metrics.reader import Metric
 from vllm.v1.spec_decode.metrics import compute_acceptance_rate
 
 

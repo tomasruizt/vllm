@@ -413,8 +413,7 @@ class DraftModelKVCacheCoordinator(KVCacheCoordinator):
                 block_pool=self.block_pool,
                 kv_cache_spec=group.kv_cache_spec,
                 use_eagle=self.use_eagle,
-            )
-            for i, (group, manager) in enumerate(zip(groups, managers))
+            ) for i, (group, manager) in enumerate(zip(groups, managers))
         ]
         blocks = res1 + res2
         num_blocks = min(len(blocks[0]), len(blocks[1])) * self.block_size()
@@ -436,7 +435,7 @@ def get_kv_cache_coordinator(
         return UnitaryKVCacheCoordinator(kv_cache_config, max_model_len,
                                          use_eagle, enable_caching,
                                          enable_kv_cache_events)
-    
+
     if use_draft_model:
         return DraftModelKVCacheCoordinator(
             kv_cache_config=kv_cache_config,
@@ -445,6 +444,6 @@ def get_kv_cache_coordinator(
             enable_caching=enable_caching,
             enable_kv_cache_events=enable_kv_cache_events,
         )
-    
+
     return HybridKVCacheCoordinator(kv_cache_config, max_model_len, use_eagle,
                                     enable_caching, enable_kv_cache_events)

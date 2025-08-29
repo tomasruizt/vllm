@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from __future__ import annotations
 
-from dataclasses import dataclass
 import random
+from dataclasses import dataclass
 from typing import Any, Union
 
 import pytest
@@ -14,6 +14,7 @@ from vllm import LLM, SamplingParams
 from vllm.assets.base import VLLM_S3_BUCKET_URL
 from vllm.assets.image import VLM_IMAGES_DIR
 from vllm.distributed import cleanup_dist_env_and_memory
+from vllm.outputs import RequestOutput
 from vllm.platforms import current_platform
 from vllm.v1.spec_decode.metrics import compute_acceptance_rate
 
@@ -245,9 +246,11 @@ class ArgsTest:
     max_model_len: int = 1024
     gpu_memory_utilization: float = 0.5
 
+
 cases = [
     ArgsTest("Qwen/Qwen3-1.7B", draft_model="Qwen/Qwen3-0.6B"),
 ]
+
 
 @pytest.mark.parametrize("args", cases)
 def test_draft_model_correctness(
@@ -261,21 +264,20 @@ def test_draft_model_correctness(
         m.setenv("VLLM_USE_V1", "1")
         test_prompts = get_test_prompts(mm_enabled=args.mm_enabled)
 
-        spec_llm = LLM(
-            model=args.model,
-            tensor_parallel_size=args.tp_size,
-            speculative_config={
-                "method": args.method,
-                "model": args.draft_model,
-                "num_speculative_tokens": args.num_speculative_tokens,
-                "max_model_len": args.max_model_len,
-                "enforce_eager": True,
-            },
-            max_model_len=args.max_model_len,
-            gpu_memory_utilization=args.gpu_memory_utilization,
-            enforce_eager=True,
-            disable_log_stats=False
-        )
+        spec_llm = LLM(model=args.model,
+                       tensor_parallel_size=args.tp_size,
+                       speculative_config={
+                           "method": args.method,
+                           "model": args.draft_model,
+                           "num_speculative_tokens":
+                           args.num_speculative_tokens,
+                           "max_model_len": args.max_model_len,
+                           "enforce_eager": True,
+                       },
+                       max_model_len=args.max_model_len,
+                       gpu_memory_utilization=args.gpu_memory_utilization,
+                       enforce_eager=True,
+                       disable_log_stats=False)
         spec_outputs = spec_llm.chat(test_prompts, sampling_config)
         acceptance_rate = compute_acceptance_rate(spec_llm.get_metrics())
         del spec_llm
@@ -300,13 +302,12 @@ def test_draft_model_correctness(
         for actual, expected in zip(spec_outputs, ref_outputs):
             assert actual.prompt_token_ids == expected.prompt_token_ids
         assert_outputs_match(ref_outputs, spec_outputs, 1.0)
-        
+
         assert acceptance_rate == 1.0
 
 
-def assert_outputs_match(
-    ref_outputs: list[str], spec_outputs: list[str], fraction: float
-):
+def assert_outputs_match(ref_outputs: list[RequestOutput],
+                         spec_outputs: list[RequestOutput], fraction: float):
     """Assert that at least "fraction" of the prompts match exactly"""
     matches = 0
     misses = 0

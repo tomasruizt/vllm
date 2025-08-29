@@ -6,10 +6,10 @@ from typing import Optional
 
 import numpy as np
 import prometheus_client
-from prometheus_client import Metric
 
 from vllm.config import SpeculativeConfig
 from vllm.logger import init_logger
+from vllm.v1.metrics.reader import Metric
 
 logger = init_logger(__name__)
 
@@ -181,6 +181,8 @@ class SpecDecodingProm:
 
 def compute_acceptance_rate(metrics: list[Metric]) -> float:
     name2metric = {metric.name: metric for metric in metrics}
-    n_draft_toks = name2metric["vllm:spec_decode_num_draft_tokens"].value
-    n_accepted_toks = name2metric["vllm:spec_decode_num_accepted_tokens"].value
+    n_draft_toks = name2metric[
+        "vllm:spec_decode_num_draft_tokens"].value  # type: ignore
+    n_accepted_toks = name2metric[
+        "vllm:spec_decode_num_accepted_tokens"].value  # type: ignore
     return n_accepted_toks / n_draft_toks
