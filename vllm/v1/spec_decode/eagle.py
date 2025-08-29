@@ -182,7 +182,8 @@ class EagleProposer:
         # E.g., [b1, b2, c1, c2, c3, c3] -> [a2, b2, b3, c2, c3, c4]
         self.input_ids[last_token_indices] = next_token_ids
 
-        if sampling_metadata.all_greedy:
+        return_log_probs = not sampling_metadata.all_greedy
+        if not return_log_probs:
             log_probs = None
         else:
             log_probs = torch.empty((batch_size, self.num_speculative_tokens),
@@ -249,16 +250,16 @@ class EagleProposer:
                 common_attn_metadata=common_attn_metadata,
             )
             # [batch_size, num_tree_tokens]
-            return Proposal(token_ids=torch.cat(draft_token_ids_list, dim=1),
-                            log_probs=log_probs)
+            return Proposal(
+                token_ids=torch.cat(draft_token_ids_list, dim=1),
+                # FIXME: Implement log_probs for tree attention
+                log_probs=None)
 
+        only_sampled_token = 0
         sampler_out = self.runner.sampler(
-            logits, replace(sampling_metadata, max_num_logprobs=1))
+            logits,
+            replace(sampling_metadata, max_num_logprobs=only_sampled_token))
         draft_token_ids = sampler_out.sampled_token_ids.flatten()
-
-        if not sampling_metadata.all_greedy:
-            log_probs = ...
-            raise NotImplementedError
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:
@@ -273,6 +274,9 @@ class EagleProposer:
 
         # Generate the remaining draft tokens.
         draft_token_ids_list = [draft_token_ids]
+        if return_log_probs:
+            assert log_probs is not None
+            log_probs[:, 0] = sampler_out.logprobs_tensors.logprobs.flatten()
 
         if self.use_cuda_graph and \
                 batch_size <= self.cudagraph_batch_sizes[-1]:
@@ -282,7 +286,7 @@ class EagleProposer:
         attn_metadata.num_actual_tokens = batch_size
         attn_metadata.max_query_len = 1
         attn_metadata.query_start_loc = self.arange[:batch_size + 1]
-        for _ in range(self.num_speculative_tokens - 1):
+        for idx in range(1, self.num_speculative_tokens):
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
@@ -355,11 +359,14 @@ class EagleProposer:
             logits = self.model.compute_logits(last_hidden_states[:batch_size],
                                                None)
             sampler_out = self.runner.sampler(
-                logits, replace(sampling_metadata, max_num_logprobs=1))
+                logits,
+                replace(sampling_metadata,
+                        max_num_logprobs=only_sampled_token))
             draft_token_ids = sampler_out.sampled_token_ids.flatten()
-            if not sampling_metadata.all_greedy:
-                log_probs = ...
-                raise NotImplementedError
+            if return_log_probs:
+                assert log_probs is not None
+                new_logprobs = sampler_out.logprobs_tensors.logprobs.flatten()
+                log_probs[:, idx] = new_logprobs
             draft_token_ids_list.append(draft_token_ids)
 
         # [batch_size, num_speculative_tokens]
