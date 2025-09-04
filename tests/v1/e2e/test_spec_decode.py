@@ -309,6 +309,8 @@ def test_draft_model_correctness(args: ArgsTest,
     torch.cuda.empty_cache()
     cleanup_dist_env_and_memory()
 
+    assert acceptance_rate >= args.expected_acceptance_rate
+
     ref_llm = LLM(
         model=args.model,
         max_model_len=args.max_model_len,
@@ -323,25 +325,24 @@ def test_draft_model_correctness(args: ArgsTest,
     assert len(ref_outputs) > 0
     assert len(ref_outputs) == len(spec_outputs)
 
-    assert_outputs_match(ref_outputs, spec_outputs,
-                         args.expected_same_output_fraction)
+    match_fraction = compute_exact_matches(ref_outputs, spec_outputs)
+    assert match_fraction >= args.expected_same_output_fraction
 
-    assert acceptance_rate >= args.expected_acceptance_rate
+    print(f"spec-decode: target={args.model}, draft={args.draft_model}, "
+          f"temperature={args.sampling_config.temperature:.2f}, "
+          f"acceptance_rate={acceptance_rate:.2f}, "
+          f"match_fraction={match_fraction:.2f}")
 
 
-def assert_outputs_match(ref_outputs: list[RequestOutput],
-                         spec_outputs: list[RequestOutput], fraction: float):
-    """Assert that at least "fraction" of the prompts match exactly"""
+def compute_exact_matches(ref_outputs: list[RequestOutput],
+                          spec_outputs: list[RequestOutput]) -> float:
+    """Compute the fraction of the prompts that match exactly"""
+    assert len(ref_outputs) == len(spec_outputs)
     matches = 0
-    misses = 0
     for ref_output, spec_output in zip(ref_outputs, spec_outputs):
         if ref_output.outputs[0].text == spec_output.outputs[0].text:
             matches += 1
         else:
-            misses += 1
             print(f"ref_output: {ref_output.outputs[0].text}")
             print(f"spec_output: {spec_output.outputs[0].text}")
-
-    # Heuristic: at least a certain fraction of the outputs to match exactly
-    # Upon failure, inspect the outputs to check for inaccuracy.
-    assert matches >= int(fraction * len(ref_outputs))
+    return matches / len(ref_outputs)
