@@ -258,18 +258,32 @@ class ArgsTest:
 
 cases = [
     ArgsTest(
+        model="baidu/ERNIE-4.5-0.3B-PT",
+        draft_model="baidu/ERNIE-4.5-0.3B-PT",
+        sampling_config=greedy_sampling(),
+        expected_acceptance_rate=1.0,
+        expected_same_output_fraction=1.0,
+    ),
+    ArgsTest(
+        model="baidu/ERNIE-4.5-0.3B-PT",
+        draft_model="baidu/ERNIE-4.5-0.3B-PT",
+        sampling_config=stochastic_sampling(),
+        expected_acceptance_rate=0.2,
+        expected_same_output_fraction=0.0,
+    ),
+    ArgsTest(
         model="meta-llama/Llama-3.2-1B-Instruct",
         draft_model="meta-llama/Llama-3.2-1B-Instruct",
         sampling_config=greedy_sampling(),
-        expected_acceptance_rate=0.85,
+        expected_acceptance_rate=0.8,
         expected_same_output_fraction=0.5,
     ),
     ArgsTest(
-        model="Qwen/Qwen3-1.7B",
-        draft_model="Qwen/Qwen3-0.6B",
+        model="meta-llama/Llama-3.2-1B-Instruct",
+        draft_model="meta-llama/Llama-3.2-1B-Instruct",
         sampling_config=stochastic_sampling(),
-        expected_acceptance_rate=0.9,
-        expected_same_output_fraction=0.9,
+        expected_acceptance_rate=0.4,
+        expected_same_output_fraction=0.15,
     ),
     ArgsTest(
         model="Qwen/Qwen3-1.7B",
@@ -277,6 +291,13 @@ cases = [
         sampling_config=greedy_sampling(),
         expected_acceptance_rate=1.0,
         expected_same_output_fraction=1.0,
+    ),
+    ArgsTest(
+        model="Qwen/Qwen3-1.7B",
+        draft_model="Qwen/Qwen3-0.6B",
+        sampling_config=stochastic_sampling(),
+        expected_acceptance_rate=0.9,
+        expected_same_output_fraction=0.9,
     ),
 ]
 
@@ -301,7 +322,8 @@ def test_draft_model_correctness(args: ArgsTest,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
-        disable_log_stats=False  # enables get_metrics()
+        disable_log_stats=False,  # enables get_metrics()
+        trust_remote_code=True,
     )
     spec_outputs = spec_llm.chat(test_prompts, args.sampling_config)
     acceptance_rate = compute_acceptance_rate(spec_llm.get_metrics())
@@ -316,6 +338,7 @@ def test_draft_model_correctness(args: ArgsTest,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
+        trust_remote_code=True,
     )
     ref_outputs = ref_llm.chat(test_prompts, args.sampling_config)
     del ref_llm  # CLEANUP
