@@ -185,6 +185,8 @@ class SpecDecodeProposer:
         assert self.runner is not None
 
         # FIXME: need to consider multiple kv_cache_groups
+        assert len(self.runner.attn_groups) == 1
+        assert len(self.runner.attn_groups[0]) == 1
         attn_metadata = self.runner.attn_groups[0][0].metadata_builder\
             .build_for_drafting(common_attn_metadata=common_attn_metadata,
                                 draft_index=0)

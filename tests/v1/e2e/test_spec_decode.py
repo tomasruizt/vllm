@@ -323,7 +323,6 @@ def test_draft_model_correctness(args: ArgsTest,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
         disable_log_stats=False,  # enables get_metrics()
-        trust_remote_code=True,
     )
     spec_outputs = spec_llm.chat(test_prompts, args.sampling_config)
     acceptance_rate = compute_acceptance_rate(spec_llm.get_metrics())
@@ -338,7 +337,6 @@ def test_draft_model_correctness(args: ArgsTest,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         enforce_eager=args.enforce_eager,
-        trust_remote_code=True,
     )
     ref_outputs = ref_llm.chat(test_prompts, args.sampling_config)
     del ref_llm  # CLEANUP
