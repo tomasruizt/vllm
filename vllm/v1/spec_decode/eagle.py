@@ -15,7 +15,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
 )
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
@@ -35,6 +35,7 @@ from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
+from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -306,6 +307,11 @@ class SpecDecodeBaseProposer:
             cudagraph_runtime_mode=cudagraph_runtime_mode,
         ):
             ret_hidden_states = self.model(**model_kwargs)
+            self.runner.log_toks("drafter inputs", model_kwargs["input_ids"])
+            if self.runner.do_log:
+                print("drafter positions", model_kwargs["positions"])
+                print("block_table_tensor", common_attn_metadata.block_table_tensor)
+                print("slot_mapping", common_attn_metadata.slot_mapping)
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -358,10 +364,12 @@ class SpecDecodeBaseProposer:
 
         if self.use_cuda_graph and batch_size <= self.cudagraph_batch_sizes[-1]:
             input_batch_size = self.vllm_config.pad_for_cudagraph(batch_size)
-            cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
         else:
             input_batch_size = batch_size
-            cudagraph_runtime_mode = CUDAGraphMode.NONE
+
+        bd = BatchDescriptor(num_tokens=input_batch_size, uniform_decode=True)
+        d: CudagraphDispatcher = self.runner.cudagraph_dispatcher
+        cudagraph_runtime_mode, bd = d.dispatch(bd)
 
         common_attn_metadata.num_actual_tokens = batch_size
         common_attn_metadata.max_query_len = 1
@@ -397,6 +405,8 @@ class SpecDecodeBaseProposer:
                 exceeds_max_model_len = positions >= self.max_model_len
                 clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
 
+            assert not exceeds_max_model_len.any()
+
             # Increment the sequence lengths.
             common_attn_metadata.seq_lens += 1
             common_attn_metadata.seq_lens_cpu += 1
@@ -419,20 +429,26 @@ class SpecDecodeBaseProposer:
                 dim=1, index=block_numbers.view(-1, 1)
             )
             block_ids = block_ids.view(-1)
+
+            common_attn_metadata.slot_mapping = torch.empty(
+                input_batch_size, device="cuda", dtype=torch.int64
+            )
+
             if self.uses_mrope:
-                common_attn_metadata.slot_mapping = (
+                common_attn_metadata.slot_mapping[:batch_size] = (
                     block_ids * self.block_size + clamped_positions[0] % self.block_size
                 )
             else:
-                common_attn_metadata.slot_mapping = (
+                common_attn_metadata.slot_mapping[:batch_size] = (
                     block_ids * self.block_size + clamped_positions % self.block_size
                 )
+            common_attn_metadata.slot_mapping[batch_size:] = PADDING_SLOT_ID
             # Mask out the slot mappings that exceed the max model length.
             # Otherwise, the KV cache will be inadvertently updated with the
             # padding tokens.
-            common_attn_metadata.slot_mapping.masked_fill_(
-                exceeds_max_model_len, PADDING_SLOT_ID
-            )
+            # common_attn_metadata.slot_mapping.masked_fill_(
+            #     exceeds_max_model_len, PADDING_SLOT_ID
+            # )
 
             # Rebuild attention metadata
             attn_metadata = attn_metadata_builder.build_for_drafting(  # type: ignore
@@ -470,8 +486,14 @@ class SpecDecodeBaseProposer:
                 self.vllm_config,
                 num_tokens=input_batch_size,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=bd,
             ):
                 ret_hidden_states = self.model(**model_kwargs)
+                self.runner.log_toks("drafter inputs", model_kwargs["input_ids"])
+                if self.runner.do_log:
+                    print("drafter positions", model_kwargs["positions"])
+                    print("block_table_tensor", common_attn_metadata.block_table_tensor)
+                    print("slot_mapping", common_attn_metadata.slot_mapping)
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
@@ -485,6 +507,9 @@ class SpecDecodeBaseProposer:
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        if self.runner.do_log:
+            for idx, toks in enumerate(draft_token_ids):
+                self.runner.log_toks(f"proposed toks [{idx}]", toks)
         return draft_token_ids
 
     def set_input_ids_first_pass(
@@ -1078,18 +1103,15 @@ class SpecDecodeBaseProposer:
     def dummy_run(
         self,
         num_tokens: int,
-        use_cudagraphs=True,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        batch_descriptor: BatchDescriptor,
     ) -> None:
-        if use_cudagraphs and num_tokens <= self.cudagraph_batch_sizes[-1]:
-            num_tokens = self.vllm_config.pad_for_cudagraph(num_tokens)
-
         with set_forward_context(
             None,
             self.vllm_config,
             num_tokens=num_tokens,
-            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE
-            if use_cudagraphs
-            else CUDAGraphMode.NONE,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
         ):
             if self.supports_mm_inputs:
                 input_ids = None
