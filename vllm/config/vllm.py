@@ -765,24 +765,6 @@ class VllmConfig:
         """
         return replace(self, **kwargs)
 
-    def set_rank(self, rank: int):
-        self.parallel_config.rank = rank
-        self._if_necessary_set_rank_in_draft_parallel_config(rank)
-
-    def _if_necessary_set_rank_in_draft_parallel_config(self, rank: int):
-        """If the speculative config is tensor parallel,
-        and it has the same tensor parallel size as the target model,
-        then set the rank in the speculative parallel config, too."""
-        sd_cfg: SpeculativeConfig | None = self.speculative_config
-        set_rank = (
-            sd_cfg is not None
-            and sd_cfg.draft_parallel_config is not None
-            and sd_cfg.draft_parallel_config.tensor_parallel_size
-            == self.parallel_config.tensor_parallel_size
-        )
-        if set_rank:
-            sd_cfg.draft_parallel_config.rank = rank
-
     def __str__(self):
         return (
             f"model={self.model_config.model!r}, "

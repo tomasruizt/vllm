@@ -80,7 +80,9 @@ class SpeculativeConfig:
     """The degree of the tensor parallelism for the draft model. Can only be 1
     or the same as the target model's tensor parallel size."""
     tensor_parallel_size: int | None = None
-    """This is only used to capture and reject if passed"""
+    """Users should pass "draft_tensor_parallel_size". This parameters is only 
+    to reject it if passed."""
+
     disable_logprobs: bool = True
     """If set to True, token log probabilities are not returned during
     speculative decoding. If set to False, token log probabilities are returned

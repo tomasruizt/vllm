@@ -171,16 +171,19 @@ def create_vllm_config_for_draft_model(
     target_model_vllm_config: VllmConfig,
 ) -> VllmConfig:
     """The vllm_config is configured for the target model, e.g.
-    its quant_config and parallel_config. But the draft model might
-    not be quantized the same way, and might have different tensor_parallel_size.
-    We need to create a new vllm_config for the draft model.
-    This is vllm_config is useful when loading the draft model.
+    its quant_config and parallel_config. But the draft model is potentially
+    quantized differently, and has potentially different tensor_parallel_size.
+    This function creates a new vllm_config configured for the draft model.
+    The vllm_config is useful when loading the draft model with get_model().
     """
     old = target_model_vllm_config
+    new_parallel_config = old.speculative_config.draft_parallel_config.replace(
+        rank=old.parallel_config.rank
+    )
     new: VllmConfig = old.replace(
         quant_config=None,  # quant_config is recomputed in __init__()
         model_config=old.speculative_config.draft_model_config,
-        parallel_config=old.speculative_config.draft_parallel_config,
+        parallel_config=new_parallel_config,
     )
     return new
 

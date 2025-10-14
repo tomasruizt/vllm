@@ -427,6 +427,7 @@ def test_draft_model_quantization(models: tuple[str, str], enforce_eager: bool):
 
 
 def test_draft_model_tensor_parallelism():
+    """Ensure spec decode works when running with TP > 1."""
     sd_case = ArgsTest(
         target_model="Qwen/Qwen3-1.7B",
         target_tensor_parallel_size=2,
@@ -438,6 +439,9 @@ def test_draft_model_tensor_parallelism():
 
 
 def test_draft_model_engine_args_tensor_parallelism():
+    """Ensure the vllm_config for the draft model is created correctly,
+    and independently of the target model (quantization, TP, etc.)"""
+
     engine_args = EngineArgs(
         model="Qwen/Qwen3-1.7B-FP8",  # <<< tgt quantized
         tensor_parallel_size=4,
@@ -458,17 +462,17 @@ def test_draft_model_engine_args_tensor_parallelism():
 
 
 def test_draft_model_engine_args_rejects_invalid_tp_argname():
-    """The user should pass "draft_tensor_parallel_size", rather than
-    "tensor_parallel_size". This is to catch bad syntax early."""
+    """The user should pass "draft_tensor_parallel_size" rather than
+    "tensor_parallel_size". We enforce this with validation."""
 
     engine_args = EngineArgs(
         model="Qwen/Qwen3-1.7B",
-        tensor_parallel_size=2,
+        tensor_parallel_size=1,
         speculative_config={
             "model": "Qwen/Qwen3-0.6B",
             "method": "draft_model",
             "num_speculative_tokens": 3,
-            "tensor_parallel_size": 1,  # invalid arg name
+            "tensor_parallel_size": 1,  # <<< invalid arg name
         },
     )
     with pytest.raises(ValueError):
