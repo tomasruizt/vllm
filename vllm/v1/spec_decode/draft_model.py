@@ -131,9 +131,10 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             target_model_vllm_config=self.vllm_config
         )
         logger.info(
-            "Starting to load model %s with tensor_parallel_size %d...",
+            "Starting to load draft model %s. TP=%d, rank=%d",
             draft_vllm_config.model_config.model,
             draft_vllm_config.parallel_config.tensor_parallel_size,
+            draft_vllm_config.parallel_config.rank,
         )
         with set_model_tag("draft_model"):
             self.model = get_model(vllm_config=draft_vllm_config, prefix="draft_model")
