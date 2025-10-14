@@ -110,6 +110,12 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         self.vllm_config.speculative_config.verify_equal_vocab_size_if_draft_model()
 
     def _raise_if_draft_tp_mismatch(self):
+        # Note(Tomas Ruiz) If we run the target model with TP > 1 and
+        # the draft model with TP = 1, then the different TP ranks collide.
+        # Specifically when all ranks compile the draft model on rank 0
+        # (because TP=1), then the torch compile cache is overwritten and corrupted.
+        # We need a mechanism like this: https://github.com/vllm-project/vllm/pull/5414
+        # To prevent this error, we assert that both TP sizes must be the same.
         spec_cfg: SpeculativeConfig = self.vllm_config.speculative_config
         tgt_tp = spec_cfg.target_parallel_config.tensor_parallel_size
         draft_tp = spec_cfg.draft_parallel_config.tensor_parallel_size
