@@ -545,9 +545,6 @@ class SpeculativeConfig:
                 "speculative_config. Please pass 'draft_tensor_parallel_size' instead."
             )
 
-        if self.draft_tensor_parallel_size > 1:
-            raise ValueError("Only draft_tensor_parallel_size=1 is implemented so far.")
-
         if self.num_speculative_tokens is None:
             raise ValueError(
                 "num_speculative_tokens must be provided with "

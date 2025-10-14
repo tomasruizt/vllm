@@ -431,16 +431,16 @@ def test_draft_model_tensor_parallelism():
         target_model="Qwen/Qwen3-1.7B",
         target_tensor_parallel_size=2,
         draft_model="Qwen/Qwen3-0.6B",
-        draft_tensor_parallel_size=1,
+        draft_tensor_parallel_size=2,
         **some_high_acceptance_metrics(),
     )
-    assert_draft_model_correctness(sd_case, enforce_eager=True)
+    assert_draft_model_correctness(sd_case, enforce_eager=False)
 
 
 def test_draft_model_engine_args_tensor_parallelism():
     engine_args = EngineArgs(
         model="Qwen/Qwen3-1.7B-FP8",  # <<< tgt quantized
-        tensor_parallel_size=2,
+        tensor_parallel_size=4,
         speculative_config={
             "model": "Qwen/Qwen3-0.6B",  # <<< draft not quantized
             "method": "draft_model",
@@ -449,12 +449,8 @@ def test_draft_model_engine_args_tensor_parallelism():
         },
     )
     tgt_vllm_config: VllmConfig = engine_args.create_engine_config()
-    assert tgt_vllm_config.parallel_config.tensor_parallel_size == 2
+    assert tgt_vllm_config.parallel_config.tensor_parallel_size == 4
     assert tgt_vllm_config.quant_config.get_name() == "fp8"
-    assert (
-        tgt_vllm_config.speculative_config.draft_parallel_config.tensor_parallel_size
-        == 1
-    )
 
     draft_vllm_config: VllmConfig = create_vllm_config_for_draft_model(tgt_vllm_config)
     assert draft_vllm_config.parallel_config.tensor_parallel_size == 1

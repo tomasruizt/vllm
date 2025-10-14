@@ -7,6 +7,7 @@ import torch
 
 from vllm.attention.layer import Attention
 from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config.speculative import SpeculativeConfig
 from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.attention.backends.utils import (
@@ -37,6 +38,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         self._raise_if_mrope()
         self._raise_if_padded_drafter_batch()
         self._raise_if_vocab_size_mismatch()
+        self._raise_if_draft_tp_mismatch()
 
     def propose(
         self,
@@ -101,11 +103,22 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             raise NotImplementedError(
                 "Speculative Decoding with draft models does not support "
                 "padded drafter batch yet. Please pass --disable-padded-drafter-batch "
-                "in the speculative config."
+                "in the speculative_config."
             )
 
     def _raise_if_vocab_size_mismatch(self):
         self.vllm_config.speculative_config.verify_equal_vocab_size_if_draft_model()
+
+    def _raise_if_draft_tp_mismatch(self):
+        spec_cfg: SpeculativeConfig = self.vllm_config.speculative_config
+        tgt_tp = spec_cfg.target_parallel_config.tensor_parallel_size
+        draft_tp = spec_cfg.draft_parallel_config.tensor_parallel_size
+        if draft_tp != tgt_tp:
+            raise ValueError(
+                f"Currently, 'draft_tensor_parallel_size' and 'tensor_parallel_size' "
+                f"must be the same. Got {draft_tp} and {tgt_tp}. "
+                "Please pass 'draft_tensor_parallel_size' in the speculative_config."
+            )
 
     def set_input_ids_first_pass(
         self,
