@@ -6,7 +6,9 @@ from typing import Any
 import torch
 
 from vllm.attention.layer import Attention
-from vllm.config import ModelConfig, VllmConfig, get_layers_from_vllm_config
+from vllm.config import VllmConfig, get_layers_from_vllm_config
+from vllm.config.speculative import SpeculativeConfig
+from vllm.logger import init_logger
 from vllm.model_executor.model_loader import get_model
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
@@ -15,6 +17,8 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID, SpecDecodeBaseProposer
+
+logger = init_logger(__name__)
 
 
 class DraftModelProposer(SpecDecodeBaseProposer):
@@ -34,6 +38,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         self._raise_if_mrope()
         self._raise_if_padded_drafter_batch()
         self._raise_if_vocab_size_mismatch()
+        self._raise_if_draft_tp_mismatch()
 
     def propose(
         self,
@@ -98,11 +103,28 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             raise NotImplementedError(
                 "Speculative Decoding with draft models does not support "
                 "padded drafter batch yet. Please pass --disable-padded-drafter-batch "
-                "in the speculative config."
+                "in the speculative_config."
             )
 
     def _raise_if_vocab_size_mismatch(self):
         self.vllm_config.speculative_config.verify_equal_vocab_size_if_draft_model()
+
+    def _raise_if_draft_tp_mismatch(self):
+        # Note(Tomas Ruiz) If we run the target model with TP > 1 and
+        # the draft model with TP = 1, then the different TP ranks collide.
+        # Specifically when all ranks compile the draft model on rank 0
+        # (because TP=1), then the torch compile cache is overwritten and corrupted.
+        # We need a mechanism like this: https://github.com/vllm-project/vllm/pull/5414
+        # To prevent this error, we assert that both TP sizes must be the same.
+        spec_cfg: SpeculativeConfig = self.vllm_config.speculative_config
+        tgt_tp = spec_cfg.target_parallel_config.tensor_parallel_size
+        draft_tp = spec_cfg.draft_parallel_config.tensor_parallel_size
+        if draft_tp != tgt_tp:
+            raise ValueError(
+                f"Currently, 'draft_tensor_parallel_size' and 'tensor_parallel_size' "
+                f"must be the same. Got {draft_tp} and {tgt_tp}. "
+                "Please pass 'draft_tensor_parallel_size' in the speculative_config."
+            )
 
     def set_input_ids_first_pass(
         self,
@@ -115,15 +137,6 @@ class DraftModelProposer(SpecDecodeBaseProposer):
 
     def load_model(self, target_model: Any) -> None:
         """Takes target_model to satisfy the type checker."""
-        draft_model_config: ModelConfig = (
-            self.vllm_config.speculative_config.draft_model_config
-        )
-        # Recompute quant_config, which is configured for the target model
-        # But the draft model might not be quantized.
-        vllm_config_draft: VllmConfig = self.vllm_config.replace(
-            quant_config=None,
-            model_config=draft_model_config,
-        )
 
         # This must be computed before loading the draft model
         # because that mutates the forward_context of the vllm_config
@@ -133,12 +146,17 @@ class DraftModelProposer(SpecDecodeBaseProposer):
 
         from vllm.compilation.backends import set_model_tag
 
+        draft_vllm_config: VllmConfig = create_vllm_config_for_draft_model(
+            target_model_vllm_config=self.vllm_config
+        )
+        logger.info(
+            "Starting to load draft model %s. TP=%d, rank=%d",
+            draft_vllm_config.model_config.model,
+            draft_vllm_config.parallel_config.tensor_parallel_size,
+            draft_vllm_config.parallel_config.rank,
+        )
         with set_model_tag("draft_model"):
-            self.model = get_model(
-                vllm_config=vllm_config_draft,
-                model_config=draft_model_config,
-                prefix="draft_model",
-            )
+            self.model = get_model(vllm_config=draft_vllm_config, prefix="draft_model")
 
         # This must be computed after loading the draft model
         # because that mutates the forward_context of the vllm_config
@@ -147,6 +165,27 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             - target_attn_layer_names
         )
         self.attn_layer_names = list(draft_attn_layer_names)
+
+
+def create_vllm_config_for_draft_model(
+    target_model_vllm_config: VllmConfig,
+) -> VllmConfig:
+    """The vllm_config is configured for the target model, e.g.
+    its quant_config and parallel_config. But the draft model is potentially
+    quantized differently, and has potentially different tensor_parallel_size.
+    This function creates a new vllm_config configured for the draft model.
+    The vllm_config is useful when loading the draft model with get_model().
+    """
+    old = target_model_vllm_config
+    new_parallel_config = old.speculative_config.draft_parallel_config.replace(
+        rank=old.parallel_config.rank
+    )
+    new: VllmConfig = old.replace(
+        quant_config=None,  # quant_config is recomputed in __init__()
+        model_config=old.speculative_config.draft_model_config,
+        parallel_config=new_parallel_config,
+    )
+    return new
 
 
 @dataclass

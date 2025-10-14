@@ -11,9 +11,12 @@ from tests.utils import get_attn_backend_list_based_on_platform, large_gpu_mark
 from vllm import LLM, SamplingParams
 from vllm.assets.base import VLLM_S3_BUCKET_URL
 from vllm.assets.image import VLM_IMAGES_DIR
+from vllm.config.vllm import VllmConfig
 from vllm.distributed import cleanup_dist_env_and_memory
+from vllm.engine.arg_utils import EngineArgs
 from vllm.outputs import RequestOutput
 from vllm.platforms import current_platform
+from vllm.v1.spec_decode.draft_model import create_vllm_config_for_draft_model
 from vllm.v1.spec_decode.metrics import compute_acceptance_len, compute_acceptance_rate
 
 MTP_SIMILARITY_RATE = 0.8
@@ -359,7 +362,7 @@ def test_mtp_correctness(
 
 @dataclass
 class ArgsTest:
-    model: str
+    target_model: str
     draft_model: str
     sampling_config: SamplingParams
     num_speculative_tokens: int
@@ -376,7 +379,7 @@ class ArgsTest:
 cases = [
     # Same model for draft and target, greedy sampling.
     ArgsTest(
-        model="Qwen/Qwen3-0.6B",
+        target_model="Qwen/Qwen3-0.6B",
         draft_model="Qwen/Qwen3-0.6B",
         sampling_config=greedy_sampling(),
         num_speculative_tokens=3,  # K
@@ -386,7 +389,7 @@ cases = [
     ),
     # Smaller draft model, stochastic sampling.
     ArgsTest(
-        model="Qwen/Qwen3-1.7B",
+        target_model="Qwen/Qwen3-1.7B",
         draft_model="Qwen/Qwen3-0.6B",
         sampling_config=stochastic_sampling(),
         num_speculative_tokens=3,
@@ -416,15 +419,64 @@ def test_draft_model_correctness(args: ArgsTest, enforce_eager: bool):
 def test_draft_model_quantization(models: tuple[str, str], enforce_eager: bool):
     tgt_model, draft_model = models
     sd_case = ArgsTest(
-        model=tgt_model,
+        target_model=tgt_model,
         draft_model=draft_model,
-        sampling_config=greedy_sampling(),
-        num_speculative_tokens=3,
-        expected_acceptance_len=2.95 + 1,
-        expected_acceptance_rate=0.95,
-        expected_same_output_fraction=0.95,
+        **some_high_acceptance_metrics(),
     )
     assert_draft_model_correctness(sd_case, enforce_eager)
+
+
+def test_draft_model_tensor_parallelism():
+    """Ensure spec decode works when running with TP > 1."""
+    sd_case = ArgsTest(
+        target_model="Qwen/Qwen3-1.7B",
+        target_tensor_parallel_size=2,
+        draft_model="Qwen/Qwen3-0.6B",
+        draft_tensor_parallel_size=2,
+        **some_high_acceptance_metrics(),
+    )
+    assert_draft_model_correctness(sd_case, enforce_eager=False)
+
+
+def test_draft_model_engine_args_tensor_parallelism():
+    """Ensure the vllm_config for the draft model is created correctly,
+    and independently of the target model (quantization, TP, etc.)"""
+
+    engine_args = EngineArgs(
+        model="Qwen/Qwen3-1.7B-FP8",  # <<< tgt quantized
+        tensor_parallel_size=4,
+        speculative_config={
+            "model": "Qwen/Qwen3-0.6B",  # <<< draft not quantized
+            "method": "draft_model",
+            "num_speculative_tokens": 3,
+            "draft_tensor_parallel_size": 1,  # <<< valid arg name
+        },
+    )
+    tgt_vllm_config: VllmConfig = engine_args.create_engine_config()
+    assert tgt_vllm_config.parallel_config.tensor_parallel_size == 4
+    assert tgt_vllm_config.quant_config.get_name() == "fp8"
+
+    draft_vllm_config: VllmConfig = create_vllm_config_for_draft_model(tgt_vllm_config)
+    assert draft_vllm_config.parallel_config.tensor_parallel_size == 1
+    assert draft_vllm_config.quant_config is None
+
+
+def test_draft_model_engine_args_rejects_invalid_tp_argname():
+    """The user should pass "draft_tensor_parallel_size" rather than
+    "tensor_parallel_size". We enforce this with validation."""
+
+    engine_args = EngineArgs(
+        model="Qwen/Qwen3-1.7B",
+        tensor_parallel_size=1,
+        speculative_config={
+            "model": "Qwen/Qwen3-0.6B",
+            "method": "draft_model",
+            "num_speculative_tokens": 3,
+            "tensor_parallel_size": 1,  # <<< invalid arg name
+        },
+    )
+    with pytest.raises(ValueError):
+        engine_args.create_engine_config()
 
 
 def assert_draft_model_correctness(args: ArgsTest, enforce_eager: bool):
@@ -433,14 +485,14 @@ def assert_draft_model_correctness(args: ArgsTest, enforce_eager: bool):
     test_prompts = get_test_prompts(mm_enabled=False, quiet=True)
 
     spec_llm = LLM(
-        model=args.model,
+        model=args.target_model,
         speculative_config={
             "model": args.draft_model,
             "method": "draft_model",
             "num_speculative_tokens": args.num_speculative_tokens,
             "max_model_len": args.max_model_len,
             "enforce_eager": enforce_eager,
-            "tensor_parallel_size": args.draft_tensor_parallel_size,
+            "draft_tensor_parallel_size": args.draft_tensor_parallel_size,
             "disable_padded_drafter_batch": True,
             "max_num_seqs": 100,  # limit cudagraph capture runtime
         },
@@ -462,7 +514,7 @@ def assert_draft_model_correctness(args: ArgsTest, enforce_eager: bool):
     assert acceptance_len >= args.expected_acceptance_len
 
     ref_llm = LLM(
-        model=args.model,
+        model=args.target_model,
         max_model_len=args.max_model_len,
         gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=args.target_tensor_parallel_size,
@@ -480,7 +532,7 @@ def assert_draft_model_correctness(args: ArgsTest, enforce_eager: bool):
     assert match_fraction >= args.expected_same_output_fraction
 
     print(
-        f"spec-decode: target={args.model}, draft={args.draft_model}, "
+        f"spec-decode: target={args.target_model}, draft={args.draft_model}, "
         f"temperature={args.sampling_config.temperature:.2f}, "
         f"acceptance_rate={acceptance_rate:.2f}, "
         f"acceptance_len={acceptance_len:.2f}, "
@@ -501,3 +553,13 @@ def compute_exact_matches(
             print(f"ref_output: {ref_output.outputs[0].text}")
             print(f"spec_output: {spec_output.outputs[0].text}")
     return matches / len(ref_outputs)
+
+
+def some_high_acceptance_metrics() -> dict:
+    return {
+        "sampling_config": greedy_sampling(),
+        "num_speculative_tokens": 3,
+        "expected_acceptance_len": 2.95 + 1,
+        "expected_acceptance_rate": 0.95,
+        "expected_same_output_fraction": 0.95,
+    }
