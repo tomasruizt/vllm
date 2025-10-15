@@ -307,11 +307,16 @@ class SpecDecodeBaseProposer:
             cudagraph_runtime_mode=cudagraph_runtime_mode,
         ):
             ret_hidden_states = self.model(**model_kwargs)
+            if self.runner.do_log:
+                print("===== drafter forward =====")
             self.runner.log_toks("drafter inputs", model_kwargs["input_ids"])
             if self.runner.do_log:
                 print("drafter positions", model_kwargs["positions"])
-                print("block_table_tensor", common_attn_metadata.block_table_tensor)
-                print("slot_mapping", common_attn_metadata.slot_mapping)
+                for idx, block in enumerate(attn_metadata.block_table):
+                    print(f"block_table_tensor [{idx}]", block[block != 0].tolist())
+                print("slot_mapping", attn_metadata.slot_mapping.tolist())
+                print("query_start_loc", attn_metadata.query_start_loc.tolist())
+                print("seq_lens", attn_metadata.seq_lens.tolist())
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -489,11 +494,16 @@ class SpecDecodeBaseProposer:
                 batch_descriptor=bd,
             ):
                 ret_hidden_states = self.model(**model_kwargs)
+                if self.runner.do_log:
+                    print("===== drafter forward =====")
                 self.runner.log_toks("drafter inputs", model_kwargs["input_ids"])
                 if self.runner.do_log:
                     print("drafter positions", model_kwargs["positions"])
-                    print("block_table_tensor", common_attn_metadata.block_table_tensor)
-                    print("slot_mapping", common_attn_metadata.slot_mapping)
+                    for idx, block in enumerate(attn_metadata.block_table):
+                        print(f"block_table_tensor [{idx}]", block[block != 0].tolist())
+                    print("slot_mapping", attn_metadata.slot_mapping.tolist())
+                    print("query_start_loc", attn_metadata.query_start_loc.tolist())
+                    print("seq_lens", attn_metadata.seq_lens.tolist())
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
