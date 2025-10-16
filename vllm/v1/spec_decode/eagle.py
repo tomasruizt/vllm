@@ -3,6 +3,7 @@
 import ast
 from dataclasses import replace
 from importlib.util import find_spec
+from typing import Any
 
 import numpy as np
 import torch
@@ -1115,9 +1116,10 @@ class SpecDecodeBaseProposer:
         num_tokens: int,
         cudagraph_runtime_mode: CUDAGraphMode,
         batch_descriptor: BatchDescriptor,
+        attn_metadata: dict[str, Any],
     ) -> None:
         with set_forward_context(
-            None,
+            attn_metadata,
             self.vllm_config,
             num_tokens=num_tokens,
             cudagraph_runtime_mode=cudagraph_runtime_mode,

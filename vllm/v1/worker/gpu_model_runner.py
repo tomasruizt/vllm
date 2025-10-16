@@ -3512,6 +3512,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     num_tokens,
                     cudagraph_runtime_mode=cudagraph_runtime_mode,
                     batch_descriptor=batch_descriptor,
+                    attn_metadata=attn_metadata,
                 )
 
         # This is necessary to avoid blocking DP.
