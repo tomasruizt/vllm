@@ -1135,8 +1135,8 @@ class SpecDecodeBaseProposer:
 
     def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:
         """
-        Validate that all eagle layers belong to the same KVCacheGroup.
-        Need this assumption to ensure all eagle layers can use the
+        Validate that all drafting layers belong to the same KVCacheGroup.
+        Need this assumption to ensure all drafting layers can use the
         same AttentionMetadata.
         May extend to multiple AttentionMetadata in the future.
         """
@@ -1154,7 +1154,7 @@ class SpecDecodeBaseProposer:
                 )
             )
             == 1
-        ), "All eagle layers should belong to the same kv cache group"
+        ), "All drafting layers should belong to the same kv cache group"
 
 
 class EagleProposer(SpecDecodeBaseProposer):
