@@ -162,21 +162,28 @@ def extend_flat_seqs(
     that are stored in a flat format. E.g.
         [x1, x2, y1] and [x3, y2] become [x1, x2, x3, y1, y2]
     """
-    new_len = seqs.shape[0] + new_vals.shape[0]
-    new_seqs = torch.zeros(new_len, device=seqs.device, dtype=seqs.dtype)
+    dim_eq_1 = seqs.dim() == 1
+    if dim_eq_1:
+        seqs = seqs.unsqueeze(0)
+    h, w = seqs.shape  # will fail when dim > 2: not supported yet
+    new_w = w + new_vals.shape[-1]
+
+    new_seqs = torch.zeros(h, new_w, device=seqs.device, dtype=seqs.dtype)
 
     # indices for previous seqs
     start_locs = end_locs[:-1] + 1
-    seqs_new_idxs = torch.ones_like(seqs)
+    seqs_new_idxs = torch.ones(w, device=seqs.device, dtype=seqs.dtype)
     seqs_new_idxs[start_locs] += 1
-    seqs_new_idxs = seqs_new_idxs.cumsum(0) - 1
+    seqs_new_idxs = seqs_new_idxs.cumsum(-1) - 1
 
     # indices for new values
-    new_val_idxs = end_locs + 1 + torch.arange(new_vals.shape[0], device=seqs.device)
+    new_val_idxs = end_locs + 1 + torch.arange(new_vals.shape[-1], device=seqs.device)
     # assign seqs and new vals
-    new_seqs[seqs_new_idxs] = seqs
-    new_seqs[new_val_idxs] = new_vals
+    new_seqs[:, seqs_new_idxs] = seqs
+    new_seqs[:, new_val_idxs] = new_vals
 
+    if dim_eq_1:  # preserve original shape
+        new_seqs = new_seqs.squeeze(0)
     return new_seqs
 
 
