@@ -34,8 +34,6 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             pass_hidden_states_to_model=False,
             runner=runner,
         )
-        self._raise_if_multimodal()
-        self._raise_if_mrope()
         self._raise_if_padded_drafter_batch()
         self._raise_if_vocab_size_mismatch()
         self._raise_if_draft_tp_mismatch()
@@ -63,6 +61,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             cad=common_attn_metadata,
             token_ids=target_token_ids,
             positions=target_positions,
+            uses_mrope=self.draft_model_config.uses_mrope,
         )
         inputs = merge_next_token_ids_into_token_ids(
             inputs=inputs,
@@ -84,19 +83,6 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             mm_embed_inputs=None,
         )
         return draft_token_ids
-
-    def _raise_if_multimodal(self):
-        if self.supports_mm_inputs:
-            raise NotImplementedError(
-                "Speculative Decoding with draft models "
-                "does not support multimodal models yet"
-            )
-
-    def _raise_if_mrope(self):
-        if self.draft_model_config.uses_mrope:
-            raise NotImplementedError(
-                "Speculative Decoding with draft models does not support M-RoPE yet"
-            )
 
     def _raise_if_padded_drafter_batch(self):
         if not self.vllm_config.speculative_config.disable_padded_drafter_batch:
@@ -192,6 +178,7 @@ def create_vllm_config_for_draft_model(
 class DraftModelInputs:
     token_ids: torch.Tensor
     positions: torch.Tensor
+    uses_mrope: bool
     cad: CommonAttentionMetadata
 
 
@@ -215,7 +202,10 @@ def merge_next_token_ids_into_token_ids(
         seqs=inputs.token_ids, end_locs=query_end_locs, new_vals=next_token_ids
     )
     # append new positions
-    positions_to_append = inputs.positions[query_end_locs] + 1
+    if inputs.uses_mrope:
+        positions_to_append = inputs.positions[:, query_end_locs] + 1
+    else:
+        positions_to_append = inputs.positions[query_end_locs] + 1
     new_positions = extend_flat_seqs(
         seqs=inputs.positions, end_locs=query_end_locs, new_vals=positions_to_append
     )
@@ -237,5 +227,8 @@ def merge_next_token_ids_into_token_ids(
         cad, arange=arange, new_slot_mapping=new_slot_mapping
     )
     return DraftModelInputs(
-        token_ids=new_token_ids, positions=new_positions, cad=new_cad
+        token_ids=new_token_ids,
+        positions=new_positions,
+        cad=new_cad,
+        uses_mrope=inputs.uses_mrope,
     )

@@ -375,6 +375,15 @@ class ArgsTest:
 
 
 cases = [
+    ArgsTest(
+        target_model="Qwen/Qwen2.5-VL-3B-Instruct",
+        draft_model="Qwen/Qwen2.5-VL-3B-Instruct",
+        sampling_config=greedy_sampling(),
+        num_speculative_tokens=3,  # K
+        expected_acceptance_len=3 + 1,  # K + 1
+        expected_acceptance_rate=1.0,
+        gpu_memory_utilization=0.9,
+    ),
     # Same model for draft and target, greedy sampling.
     ArgsTest(
         target_model="Qwen/Qwen3-0.6B",
