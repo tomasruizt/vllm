@@ -86,13 +86,11 @@ class MultiConnector(KVConnectorBase_V1):
         super().__init__(vllm_config=vllm_config, role=role)
         self._connectors: list[KVConnectorBase_V1] = []
         self._ktc_kv_transfer_config = []
-        ktcs = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
-            "connectors"
-        )
+        ktcs = self._kv_transfer_config.kv_connector_extra_config.get("connectors")
         assert ktcs is not None
         for ktc in ktcs:
             temp_config = copy.copy(vllm_config)
-            engine_id = ktc.get("engine_id", vllm_config.kv_transfer_config.engine_id)
+            engine_id = ktc.get("engine_id", self._kv_transfer_config.engine_id)
             temp_config.kv_transfer_config = KVTransferConfig(
                 **ktc, engine_id=engine_id
             )
@@ -296,6 +294,7 @@ class MultiConnector(KVConnectorBase_V1):
             str: the required KV cache layout. e.g. HND, or NHD.
             None if the connector does not require a specific layout.
         """
+        assert vllm_config.kv_transfer_config is not None
         ktcs = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
             "connectors"
         )
@@ -325,11 +324,41 @@ class MultiConnector(KVConnectorBase_V1):
     def build_kv_connector_stats(
         cls, data: dict[str, Any] | None = None
     ) -> KVConnectorStats | None:
-        return (
-            MultiKVConnectorStats(data=data)
-            if data is not None
-            else MultiKVConnectorStats()
-        )
+        if data is None:
+            return MultiKVConnectorStats()
+
+        # data is a dict mapping connector name to their stats data.
+        # The stats data can be either:
+        # 1. Already-instantiated KVConnectorStats objects (same process)
+        # 2. Serialized dicts (cross-process after serialization)
+        # We need to reconstruct proper KVConnectorStats objects from dicts
+        reconstructed_data = {}
+        for connector_name, stats_value in data.items():
+            # If already a KVConnectorStats object, use it directly
+            if isinstance(stats_value, KVConnectorStats):
+                reconstructed_data[connector_name] = stats_value
+                continue
+
+            # Otherwise, reconstruct from serialized dict
+            # Get the connector class to reconstruct its stats
+            connector_cls = KVConnectorFactory.get_connector_class_by_name(
+                connector_name
+            )
+
+            # stats_value is the serialized dataclass which contains {'data': {...}}
+            # We need to extract the inner 'data' field to avoid double-nesting
+            assert isinstance(stats_value, dict) and "data" in stats_value, (
+                f"Expected a dict with a 'data' field, got {stats_value}"
+            )
+            inner_data = stats_value["data"]
+
+            # Use the connector's build_kv_connector_stats to reconstruct
+            if reconstructed_stats := connector_cls.build_kv_connector_stats(
+                data=inner_data
+            ):
+                reconstructed_data[connector_name] = reconstructed_stats
+
+        return MultiKVConnectorStats(data=reconstructed_data)
 
     def get_kv_connector_stats(self) -> MultiKVConnectorStats | None:
         # Group connector stats by connector type.
