@@ -2,19 +2,18 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import ExitStack
 from typing import Any
 from unittest.mock import patch
 
 import torch
 
-import vllm.envs as envs
 from vllm.compilation.counter import compilation_counter
 from vllm.compilation.monitor import validate_cudagraph_capturing_enabled
 from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.distributed.device_communicators.pynccl_allocator import set_graph_pool_id
-from vllm.forward_context import BatchDescriptor, get_forward_context
+from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import weak_ref_tensors
@@ -78,7 +77,7 @@ class CUDAGraphWrapper:
         self.compilation_config = vllm_config.compilation_config
 
         self.first_run_finished = False
-        self.is_debugging_mode = envs.VLLM_LOGGING_LEVEL == "DEBUG"
+        self.is_debugging_mode = True  # envs.VLLM_LOGGING_LEVEL == "DEBUG"
 
         # assert runtime_mode is not NONE(no cudagraph), otherwise, we don't
         # need to initialize a CUDAGraphWrapper.
@@ -150,6 +149,9 @@ class CUDAGraphWrapper:
             input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
+            if cudagraph_runtime_mode == CUDAGraphMode.FULL:
+                input_addresses.extend(get_kv_cache_addresses(forward_context))
+                input_addresses.extend(get_slot_mapping_addresses(forward_context))
             entry.input_addresses = input_addresses
             cudagraph = torch.cuda.CUDAGraph()
 
@@ -198,7 +200,10 @@ class CUDAGraphWrapper:
             new_input_addresses = [
                 x.data_ptr() for x in args if isinstance(x, torch.Tensor)
             ]
-            assert new_input_addresses == entry.input_addresses, (
+            if cudagraph_runtime_mode == CUDAGraphMode.FULL:
+                new_input_addresses.extend(get_kv_cache_addresses(forward_context))
+                new_input_addresses.extend(get_slot_mapping_addresses(forward_context))
+            assert set(new_input_addresses).issubset(set(entry.input_addresses)), (
                 f"Input addresses for cudagraphs are different "
                 f"during replay. Expected {entry.input_addresses}, "
                 f"got {new_input_addresses}"
@@ -206,3 +211,17 @@ class CUDAGraphWrapper:
 
         entry.cudagraph.replay()
         return entry.output
+
+
+def get_kv_cache_addresses(forward_context: ForwardContext) -> Iterable[int]:
+    virtual_engine = forward_context.virtual_engine
+    for attn in forward_context.no_compile_layers.values():
+        yield attn.kv_cache[virtual_engine].data_ptr()
+
+
+def get_slot_mapping_addresses(forward_context: ForwardContext) -> Iterable[int]:
+    attn_metadata = forward_context.attn_metadata
+    if attn_metadata is None:
+        return
+    for layer_attn_metadata in attn_metadata.values():
+        yield layer_attn_metadata.slot_mapping.data_ptr()
