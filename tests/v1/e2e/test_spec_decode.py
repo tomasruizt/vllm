@@ -558,7 +558,8 @@ def test_draft_model_engine_args_rejects_invalid_tp_argname():
 def assert_draft_model_correctness(args: ArgsTest, enforce_eager: bool):
     """Compare the outputs using and not using speculative decoding.
     In the greedy decoding case, the outputs must match EXACTLY."""
-    test_prompts = get_test_prompts(mm_enabled=False, quiet=True)
+    # 3 is the min bsz to trigger full CUDA graph replay.
+    test_prompts = get_test_prompts(mm_enabled=False, quiet=True)[:3]
 
     spec_llm = LLM(
         model=args.target_model,

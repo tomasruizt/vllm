@@ -100,6 +100,9 @@ class CommonAttentionMetadata:
     def query_lens(self) -> torch.Tensor:
         return self.query_start_loc[1:] - self.query_start_loc[:-1]
 
+    def query_lens_cpu(self) -> np.ndarray:
+        return self.query_start_loc_cpu[1:] - self.query_start_loc_cpu[:-1]
+
 
 def slice_query_start_locs(
     query_start_loc: torch.Tensor,
@@ -122,6 +125,7 @@ def extend_all_queries_by_1(
     common_attn_metadata: CommonAttentionMetadata,
     arange: torch.Tensor,
     new_slot_mapping: torch.Tensor,
+    new_block_table_tensor: torch.Tensor,
 ) -> CommonAttentionMetadata:
     """
     Creates a new CommonAttentionMetadata with all query lengths increased by 1.
@@ -147,8 +151,7 @@ def extend_all_queries_by_1(
         # All query lens increase by 1, so max query len increases by 1
         max_query_len=cad.max_query_len + 1,
         max_seq_len=cad.max_seq_len + 1,
-        # block table tensor depends on num requests, which stays constant
-        block_table_tensor=cad.block_table_tensor,
+        block_table_tensor=new_block_table_tensor,
         slot_mapping=new_slot_mapping,
     )
     return new_cad

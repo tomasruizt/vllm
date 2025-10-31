@@ -3,6 +3,7 @@
 import ast
 from dataclasses import replace
 from importlib.util import find_spec
+from typing import Any
 
 import numpy as np
 import torch
@@ -15,7 +16,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
 )
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.forward_context import set_forward_context
+from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
@@ -35,11 +36,13 @@ from vllm.v1.attention.backends.utils import (
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
 )
+from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.utils import CpuGpuBuffer
+from vllm.v1.worker.block_table import MultiGroupBlockTable
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 
 logger = init_logger(__name__)
@@ -133,6 +136,10 @@ class SpecDecodeBaseProposer:
         self.hidden_states = torch.zeros(
             (self.max_num_tokens, self.hidden_size), dtype=self.dtype, device=device
         )
+        self.query_start_loc = torch.zeros(
+            max_batch_size + 1, dtype=torch.int32, device=device
+        )
+        self.seq_lens = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
 
         # We need +1 here because the arange is used to set query_start_loc,
         # which has one more element than batch_size.
@@ -190,6 +197,17 @@ class SpecDecodeBaseProposer:
             device=device,
             dtype=torch.int32,
         ).repeat(max_batch_size, 1)
+
+        # Block table.
+        self.block_table = MultiGroupBlockTable(
+            max_num_reqs=self.runner.max_num_reqs,
+            max_model_len=self.runner.max_model_len,
+            max_num_batched_tokens=self.max_num_tokens,
+            pin_memory=self.runner.pin_memory,
+            device=device,
+            block_sizes=[self.runner.cache_config.block_size],
+            kernel_block_sizes=[self.runner.cache_config.block_size],
+        )
 
     def _get_positions(self, num_tokens: int):
         if self.uses_mrope:
@@ -307,6 +325,16 @@ class SpecDecodeBaseProposer:
             cudagraph_runtime_mode=cudagraph_runtime_mode,
         ):
             ret_hidden_states = self.model(**model_kwargs)
+            if self.runner.do_log:
+                print("===== drafter forward =====")
+            self.runner.log_toks("drafter inputs", model_kwargs["input_ids"])
+            if self.runner.do_log:
+                print("drafter positions", model_kwargs["positions"])
+                for idx, block in enumerate(attn_metadata.block_table):
+                    print(f"block_table_tensor [{idx}]", block[block != 0].tolist())
+                print("slot_mapping", attn_metadata.slot_mapping.tolist())
+                print("query_start_loc", attn_metadata.query_start_loc.tolist())
+                print("seq_lens", attn_metadata.seq_lens.tolist())
             if not self.model_returns_tuple():
                 last_hidden_states = ret_hidden_states
                 hidden_states = last_hidden_states
@@ -359,10 +387,12 @@ class SpecDecodeBaseProposer:
 
         if self.use_cuda_graph and batch_size <= self.cudagraph_batch_sizes[-1]:
             input_batch_size = self.vllm_config.pad_for_cudagraph(batch_size)
-            cudagraph_runtime_mode = CUDAGraphMode.PIECEWISE
         else:
             input_batch_size = batch_size
-            cudagraph_runtime_mode = CUDAGraphMode.NONE
+
+        bd = BatchDescriptor(num_tokens=input_batch_size, uniform_decode=True)
+        d: CudagraphDispatcher = self.runner.cudagraph_dispatcher
+        cudagraph_runtime_mode, bd = d.dispatch(bd)
 
         common_attn_metadata.num_actual_tokens = batch_size
         common_attn_metadata.max_query_len = 1
@@ -398,6 +428,8 @@ class SpecDecodeBaseProposer:
                 exceeds_max_model_len = positions >= self.max_model_len
                 clamped_positions = torch.where(exceeds_max_model_len, 0, positions)
 
+            assert not exceeds_max_model_len.any()
+
             # Increment the sequence lengths.
             common_attn_metadata.seq_lens += 1
             common_attn_metadata.seq_lens_cpu += 1
@@ -420,25 +452,53 @@ class SpecDecodeBaseProposer:
                 dim=1, index=block_numbers.view(-1, 1)
             )
             block_ids = block_ids.view(-1)
+
+            common_attn_metadata.slot_mapping = torch.empty(
+                input_batch_size, device="cuda", dtype=torch.int64
+            )
+
             if self.uses_mrope:
-                common_attn_metadata.slot_mapping = (
+                common_attn_metadata.slot_mapping[:batch_size] = (
                     block_ids * self.block_size + clamped_positions[0] % self.block_size
                 )
             else:
-                common_attn_metadata.slot_mapping = (
+                common_attn_metadata.slot_mapping[:batch_size] = (
                     block_ids * self.block_size + clamped_positions % self.block_size
                 )
+            common_attn_metadata.slot_mapping[batch_size:] = PADDING_SLOT_ID
             # Mask out the slot mappings that exceed the max model length.
             # Otherwise, the KV cache will be inadvertently updated with the
             # padding tokens.
-            common_attn_metadata.slot_mapping.masked_fill_(
-                exceeds_max_model_len, PADDING_SLOT_ID
-            )
+            # common_attn_metadata.slot_mapping.masked_fill_(
+            #     exceeds_max_model_len, PADDING_SLOT_ID
+            # )
 
             # Rebuild attention metadata
             attn_metadata = attn_metadata_builder.build_for_drafting(  # type: ignore
                 common_attn_metadata=common_attn_metadata, draft_index=token_index + 1
             )
+            new_slot_mapping, new_block_table_tensor = (
+                compute_block_table_and_slot_mapping(
+                    num_reqs=batch_size,
+                    query_len_cpu=common_attn_metadata.query_lens_cpu(),
+                    block_table=self.block_table,
+                    positions=clamped_positions,
+                    max_model_len=self.runner.max_model_len,
+                )
+            )
+            # copy attn_metadata to buffer for cudagraph
+            query_start_loc_len = len(attn_metadata.query_start_loc)
+            self.query_start_loc[:query_start_loc_len] = attn_metadata.query_start_loc
+            seq_lens_len = len(attn_metadata.seq_lens)
+            self.seq_lens[:seq_lens_len] = attn_metadata.seq_lens
+
+            attn_metadata = attn_metadata.replace(
+                slot_mapping=new_slot_mapping,
+                block_table=new_block_table_tensor,
+                query_start_loc=self.query_start_loc[:query_start_loc_len],
+                seq_lens=self.seq_lens[:seq_lens_len],
+            )
+
             for layer_name in self.attn_layer_names:
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
@@ -471,8 +531,19 @@ class SpecDecodeBaseProposer:
                 self.vllm_config,
                 num_tokens=input_batch_size,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=bd,
             ):
                 ret_hidden_states = self.model(**model_kwargs)
+                if self.runner.do_log:
+                    print("===== drafter forward =====")
+                self.runner.log_toks("drafter inputs", model_kwargs["input_ids"])
+                if self.runner.do_log:
+                    print("drafter positions", model_kwargs["positions"])
+                    for idx, block in enumerate(attn_metadata.block_table):
+                        print(f"block_table_tensor [{idx}]", block[block != 0].tolist())
+                    print("slot_mapping", attn_metadata.slot_mapping.tolist())
+                    print("query_start_loc", attn_metadata.query_start_loc.tolist())
+                    print("seq_lens", attn_metadata.seq_lens.tolist())
                 if not self.model_returns_tuple():
                     last_hidden_states = ret_hidden_states
                     hidden_states = ret_hidden_states
@@ -486,6 +557,9 @@ class SpecDecodeBaseProposer:
 
         # [batch_size, num_speculative_tokens]
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
+        if self.runner.do_log:
+            for idx, toks in enumerate(draft_token_ids):
+                self.runner.log_toks(f"proposed toks [{idx}]", toks)
         return draft_token_ids
 
     def set_input_ids_first_pass(
@@ -1079,18 +1153,49 @@ class SpecDecodeBaseProposer:
     def dummy_run(
         self,
         num_tokens: int,
-        use_cudagraphs=True,
+        cudagraph_runtime_mode: CUDAGraphMode,
+        batch_descriptor: BatchDescriptor,
+        attn_metadata: dict[str, Any],
+        num_reqs: int,
     ) -> None:
-        if use_cudagraphs and num_tokens <= self.cudagraph_batch_sizes[-1]:
-            num_tokens = self.vllm_config.pad_for_cudagraph(num_tokens)
+        positions = self._get_positions(num_tokens)
+
+        if attn_metadata is not None:
+            self.copy_block_table(num_reqs=num_reqs)
+            assert num_tokens % num_reqs == 0
+            query_lens_cpu = np.array([num_tokens // num_reqs] * num_reqs)
+            new_slot_mapping, new_block_table_tensor = (
+                compute_block_table_and_slot_mapping(
+                    num_reqs=num_reqs,
+                    query_len_cpu=query_lens_cpu,
+                    block_table=self.block_table,
+                    positions=positions,
+                    max_model_len=self.runner.max_model_len,
+                )
+            )
+            # copy attn_metadata to buffer for cudagraph
+            one_attn_md = list(attn_metadata.values())[0]
+            query_start_loc_len = len(one_attn_md.query_start_loc)
+            self.query_start_loc[:query_start_loc_len] = one_attn_md.query_start_loc
+            seq_lens_len = len(one_attn_md.seq_lens)
+            self.seq_lens[:seq_lens_len] = one_attn_md.seq_lens
+
+            new_attn_metadata = {}
+            for layername, attn_md in attn_metadata.items():
+                new_attn_metadata[layername] = attn_md.replace(
+                    slot_mapping=new_slot_mapping,
+                    block_table=new_block_table_tensor,
+                    query_start_loc=self.query_start_loc[:query_start_loc_len],
+                    seq_lens=self.seq_lens[:seq_lens_len],
+                )
+            attn_metadata = new_attn_metadata
 
         with set_forward_context(
-            None,
+            attn_metadata,
             self.vllm_config,
             num_tokens=num_tokens,
-            cudagraph_runtime_mode=CUDAGraphMode.PIECEWISE
-            if use_cudagraphs
-            else CUDAGraphMode.NONE,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
         ):
             if self.supports_mm_inputs:
                 input_ids = None
@@ -1101,7 +1206,7 @@ class SpecDecodeBaseProposer:
 
             model_kwargs = dict(
                 input_ids=input_ids,
-                positions=self._get_positions(num_tokens),
+                positions=positions,
                 inputs_embeds=inputs_embeds,
             )
             if self.pass_hidden_states_to_model:
@@ -1156,6 +1261,12 @@ class SpecDecodeBaseProposer:
             )
             == 1
         ), "All drafting layers should belong to the same kv cache group"
+
+    def copy_block_table(self, num_reqs: int) -> None:
+        self.block_table.block_tables[0].block_table.np[:, :] = (
+            self.runner.input_batch.block_table.block_tables[0].block_table.np
+        )
+        self.block_table.commit_block_table(num_reqs)
 
 
 class EagleProposer(SpecDecodeBaseProposer):
@@ -1221,3 +1332,32 @@ def compute_probs_and_sample_next_token(
             next_token_ids,
         )
     return next_token_ids, probs
+
+
+def compute_block_table_and_slot_mapping(
+    num_reqs: int,
+    query_len_cpu: np.ndarray,
+    block_table: MultiGroupBlockTable,
+    positions: torch.Tensor,
+    max_model_len: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    req_indices = np.repeat(range(num_reqs), query_len_cpu)
+    total_num_scheduled_tokens = req_indices.shape[0]
+    block_table.compute_slot_mapping(req_indices, positions.cpu().numpy())
+    block_table.commit_slot_mapping(total_num_scheduled_tokens)
+    assert len(block_table.block_tables) == 1
+    new_block_table_tensor = block_table[0].get_device_tensor(num_reqs)
+    new_slot_mapping = block_table[0].slot_mapping.gpu[:total_num_scheduled_tokens]
+    # Fill unused with -1. Needed for reshape_and_cache in full cuda
+    # graph mode.
+    block_table[0].slot_mapping.gpu[total_num_scheduled_tokens:].fill_(-1)
+
+    # block_table_indices = req_indices * n_blocks_per_req + new_positions // block_size
+    # block_nums = cad.block_table_tensor.view(-1)[block_table_indices]
+    # block_offsets = new_positions % block_size
+    # new_slot_mapping = block_nums * block_size + block_offsets
+    # # Mask out the position ids that exceed the max model length.
+    exceeds_max_model_len = positions >= max_model_len
+    new_slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+
+    return new_slot_mapping, new_block_table_tensor

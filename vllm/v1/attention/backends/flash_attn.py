@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashAttention."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 import torch
@@ -160,6 +160,9 @@ class FlashAttentionMetadata:
     max_num_splits: int = 0
 
     causal: bool = True
+
+    def replace(self, **kwargs) -> "FlashAttentionMetadata":
+        return replace(self, **kwargs)
 
 
 def _get_sliding_window_configs(

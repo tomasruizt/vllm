@@ -16,7 +16,11 @@ from vllm.v1.attention.backends.utils import (
     extend_flat_seqs,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
-from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID, SpecDecodeBaseProposer
+from vllm.v1.spec_decode.eagle import (
+    SpecDecodeBaseProposer,
+    compute_block_table_and_slot_mapping,
+)
+from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 logger = init_logger(__name__)
 
@@ -64,12 +68,14 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             token_ids=target_token_ids,
             positions=target_positions,
         )
+        self.copy_block_table(num_reqs=common_attn_metadata.num_reqs)
         inputs = merge_next_token_ids_into_token_ids(
             inputs=inputs,
             next_token_ids=next_token_ids,
             block_size=self.block_size,
             max_model_len=self.max_model_len,
             arange=self.arange,
+            block_table=self.block_table,
         )
 
         draft_token_ids = super().propose(
@@ -201,6 +207,7 @@ def merge_next_token_ids_into_token_ids(
     block_size: int,
     max_model_len: int,
     arange: torch.Tensor,
+    block_table: MultiGroupBlockTable,
 ) -> DraftModelInputs:
     """
     Merges the next token ids with the existing token ids into a flat sequence.
@@ -219,22 +226,22 @@ def merge_next_token_ids_into_token_ids(
     new_positions = extend_flat_seqs(
         seqs=inputs.positions, end_locs=query_end_locs, new_vals=positions_to_append
     )
+    new_query_lens_cpu = cad.query_lens_cpu() + 1
 
-    # recompute slot mapping
-    batch_size, n_blocks_per_req = cad.block_table_tensor.shape
-    req_indices = torch.arange(batch_size, device=cad.query_start_loc.device)
-    req_indices = torch.repeat_interleave(req_indices, cad.query_lens() + 1)
-    block_table_indices = req_indices * n_blocks_per_req + new_positions // block_size
-    block_nums = cad.block_table_tensor.view(-1)[block_table_indices]
-    block_offsets = new_positions % block_size
-    new_slot_mapping = block_nums * block_size + block_offsets
-    # Mask out the position ids that exceed the max model length.
-    exceeds_max_model_len = new_positions >= max_model_len
-    new_slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+    new_slot_mapping, new_block_table_tensor = compute_block_table_and_slot_mapping(
+        num_reqs=cad.num_reqs,
+        query_len_cpu=new_query_lens_cpu,
+        block_table=block_table,
+        positions=new_positions,
+        max_model_len=max_model_len,
+    )
 
     # update common_attn_metadata
     new_cad: CommonAttentionMetadata = extend_all_queries_by_1(
-        cad, arange=arange, new_slot_mapping=new_slot_mapping
+        cad,
+        arange=arange,
+        new_slot_mapping=new_slot_mapping,
+        new_block_table_tensor=new_block_table_tensor,
     )
     return DraftModelInputs(
         token_ids=new_token_ids, positions=new_positions, cad=new_cad
