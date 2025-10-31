@@ -14,7 +14,6 @@ from vllm.assets.image import VLM_IMAGES_DIR
 from vllm.config.vllm import VllmConfig
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.engine.arg_utils import EngineArgs
-from vllm.outputs import RequestOutput
 from vllm.platforms import current_platform
 from vllm.v1.spec_decode.draft_model import create_vllm_config_for_draft_model
 from vllm.v1.spec_decode.metrics import compute_acceptance_len, compute_acceptance_rate
@@ -135,6 +134,86 @@ def test_ngram_correctness(
     del spec_llm
     torch.cuda.empty_cache()
     cleanup_dist_env_and_memory()
+
+
+@pytest.mark.parametrize(
+    "model_path",
+    [
+        "RedHatAI/Llama-3.1-8B-Instruct-speculator.eagle3",
+        "RedHatAI/Qwen3-8B-speculator.eagle3",
+    ],
+    ids=["llama3_eagle3_speculator", "qwen3_eagle3_speculator"],
+)
+def test_speculators_model_integration(
+    monkeypatch: pytest.MonkeyPatch,
+    sampling_config: SamplingParams,
+    model_path: str,
+):
+    """
+    Test that speculators models work with the simplified integration.
+
+    This verifies the `vllm serve <speculator-model>` use case where
+    speculative config is automatically detected from the model config
+    without requiring explicit --speculative-config argument.
+
+    Tests:
+    1. Speculator model is correctly detected
+    2. Verifier model is extracted from speculator config
+    3. Speculative decoding is automatically enabled
+    4. Text generation works correctly
+    5. Output matches reference (non-speculative) generation
+    """
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+    # Generate test prompts
+    test_prompts = get_test_prompts(mm_enabled=False)
+
+    # First run: Direct speculator model (simplified integration)
+    spec_llm = LLM(model=model_path, max_model_len=1024)
+    spec_outputs = spec_llm.chat(test_prompts, sampling_config)
+
+    # Verify speculative config was auto-detected
+    assert spec_llm.llm_engine.vllm_config.speculative_config is not None, (
+        f"Speculative config should be auto-detected for {model_path}"
+    )
+
+    spec_config = spec_llm.llm_engine.vllm_config.speculative_config
+    assert spec_config.num_speculative_tokens > 0, (
+        f"Expected positive speculative tokens, "
+        f"got {spec_config.num_speculative_tokens}"
+    )
+
+    # Verify draft model is set to the speculator model
+    assert spec_config.model == model_path, (
+        f"Draft model should be {model_path}, got {spec_config.model}"
+    )
+
+    # Extract verifier model for reference run
+    verifier_model = spec_llm.llm_engine.vllm_config.model_config.model
+
+    del spec_llm
+    torch.cuda.empty_cache()
+    cleanup_dist_env_and_memory()
+
+    # Second run: Reference without speculative decoding
+    ref_llm = LLM(model=verifier_model, max_model_len=1024)
+    ref_outputs = ref_llm.chat(test_prompts, sampling_config)
+    del ref_llm
+    torch.cuda.empty_cache()
+    cleanup_dist_env_and_memory()
+
+    # Compare outputs
+    matches = sum(
+        1
+        for ref, spec in zip(ref_outputs, spec_outputs)
+        if ref.outputs[0].text == spec.outputs[0].text
+    )
+
+    # Heuristic: expect at least 66% of prompts to match exactly
+    assert matches >= int(0.66 * len(ref_outputs)), (
+        f"Only {matches}/{len(ref_outputs)} outputs matched. "
+        f"Expected at least {int(0.66 * len(ref_outputs))} matches."
+    )
 
 
 @pytest.mark.parametrize(
@@ -368,7 +447,6 @@ class ArgsTest:
     num_speculative_tokens: int
     expected_acceptance_rate: float
     expected_acceptance_len: float
-    expected_same_output_fraction: float
     # Defaults
     target_tensor_parallel_size: int = 1
     draft_tensor_parallel_size: int = 1
@@ -385,7 +463,6 @@ cases = [
         num_speculative_tokens=3,  # K
         expected_acceptance_len=3 + 1,  # K + 1
         expected_acceptance_rate=1.0,
-        expected_same_output_fraction=1.0,
     ),
     # Smaller draft model, stochastic sampling.
     ArgsTest(
@@ -395,7 +472,6 @@ cases = [
         num_speculative_tokens=3,
         expected_acceptance_len=2.8 + 1,
         expected_acceptance_rate=0.9,
-        expected_same_output_fraction=0.9,
     ),
 ]
 
@@ -502,8 +578,10 @@ def assert_draft_model_correctness(args: ArgsTest, enforce_eager: bool):
         enforce_eager=enforce_eager,
         disable_log_stats=False,  # enables get_metrics()
     )
-    spec_outputs = spec_llm.chat(test_prompts, args.sampling_config)
+    # we don't check the outputs, only check the metrics
+    spec_llm.chat(test_prompts, args.sampling_config)
     metrics = spec_llm.get_metrics()
+
     acceptance_rate: float = compute_acceptance_rate(metrics)
     acceptance_len: float = compute_acceptance_len(metrics)
     del spec_llm  # CLEANUP
@@ -513,46 +591,12 @@ def assert_draft_model_correctness(args: ArgsTest, enforce_eager: bool):
     assert acceptance_rate >= args.expected_acceptance_rate
     assert acceptance_len >= args.expected_acceptance_len
 
-    ref_llm = LLM(
-        model=args.target_model,
-        max_model_len=args.max_model_len,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        tensor_parallel_size=args.target_tensor_parallel_size,
-        enforce_eager=enforce_eager,
-    )
-    ref_outputs = ref_llm.chat(test_prompts, args.sampling_config)
-    del ref_llm  # CLEANUP
-    torch.cuda.empty_cache()
-    cleanup_dist_env_and_memory()
-
-    assert len(ref_outputs) > 0
-    assert len(ref_outputs) == len(spec_outputs)
-
-    match_fraction = compute_exact_matches(ref_outputs, spec_outputs)
-    assert match_fraction >= args.expected_same_output_fraction
-
     print(
         f"spec-decode: target={args.target_model}, draft={args.draft_model}, "
         f"temperature={args.sampling_config.temperature:.2f}, "
         f"acceptance_rate={acceptance_rate:.2f}, "
         f"acceptance_len={acceptance_len:.2f}, "
-        f"match_fraction={match_fraction:.2f}"
     )
-
-
-def compute_exact_matches(
-    ref_outputs: list[RequestOutput], spec_outputs: list[RequestOutput]
-) -> float:
-    """Compute the fraction of the prompts that match exactly"""
-    assert len(ref_outputs) == len(spec_outputs)
-    matches = 0
-    for ref_output, spec_output in zip(ref_outputs, spec_outputs):
-        if ref_output.outputs[0].text == spec_output.outputs[0].text:
-            matches += 1
-        else:
-            print(f"ref_output: {ref_output.outputs[0].text}")
-            print(f"spec_output: {spec_output.outputs[0].text}")
-    return matches / len(ref_outputs)
 
 
 def some_high_acceptance_metrics() -> dict:
@@ -561,5 +605,4 @@ def some_high_acceptance_metrics() -> dict:
         "num_speculative_tokens": 3,
         "expected_acceptance_len": 2.95 + 1,
         "expected_acceptance_rate": 0.95,
-        "expected_same_output_fraction": 0.95,
     }

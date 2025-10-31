@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import (
-    CompilationLevel,
+    CompilationMode,
     CUDAGraphMode,
     VllmConfig,
     get_layers_from_vllm_config,
@@ -25,7 +25,7 @@ from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache
 from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
-from vllm.utils import is_pin_memory_available
+from vllm.utils.platform_utils import is_pin_memory_available
 from vllm.v1.attention.backends.flash_attn import FlashAttentionMetadata
 from vllm.v1.attention.backends.tree_attn import (
     TreeAttentionMetadata,
@@ -39,6 +39,7 @@ from vllm.v1.attention.backends.utils import (
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.sampler import _SAMPLING_EPS
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
@@ -94,7 +95,7 @@ class SpecDecodeBaseProposer:
         self.use_cuda_graph = False
 
         compilation_config = self.vllm_config.compilation_config
-        if compilation_config.level == CompilationLevel.PIECEWISE:
+        if compilation_config.mode == CompilationMode.VLLM_COMPILE:
             cudagraph_mode = compilation_config.cudagraph_mode
             if cudagraph_mode != CUDAGraphMode.NONE and not cudagraph_mode.has_mode(
                 CUDAGraphMode.PIECEWISE
@@ -111,7 +112,7 @@ class SpecDecodeBaseProposer:
             )
 
         self.cudagraph_batch_sizes = (
-            list(reversed(self.vllm_config.compilation_config.cudagraph_capture_sizes))
+            (sorted(self.vllm_config.compilation_config.cudagraph_capture_sizes))
             if self.use_cuda_graph
             else []
         )
@@ -1014,7 +1015,7 @@ class SpecDecodeBaseProposer:
                 indexer_layers[first_layer]
                 .get_attn_backend()
                 .get_builder_cls()(
-                    indexer_layers[first_layer].get_kv_cache_spec(),
+                    indexer_layers[first_layer].get_kv_cache_spec(self.vllm_config),
                     self.indexer_layer_names,
                     self.vllm_config,
                     self.device,
@@ -1169,8 +1170,8 @@ class SpecDecodeBaseProposer:
 
     def validate_same_kv_cache_group(self, kv_cache_config: KVCacheConfig) -> None:
         """
-        Validate that all eagle layers belong to the same KVCacheGroup.
-        Need this assumption to ensure all eagle layers can use the
+        Validate that all drafting layers belong to the same KVCacheGroup.
+        Need this assumption to ensure all drafting layers can use the
         same AttentionMetadata.
         May extend to multiple AttentionMetadata in the future.
         """
@@ -1188,7 +1189,7 @@ class SpecDecodeBaseProposer:
                 )
             )
             == 1
-        ), "All eagle layers should belong to the same kv cache group"
+        ), "All drafting layers should belong to the same kv cache group"
 
 
 class EagleProposer(SpecDecodeBaseProposer):
@@ -1223,8 +1224,15 @@ def compute_probs_and_sample_next_token(
         next_token_ids = logits.argmax(dim=-1)
         return next_token_ids, probs
 
-    is_greedy = sampling_metadata.temperature == -1
-    temperature = torch.where(is_greedy, 1.0, sampling_metadata.temperature)
+    assert sampling_metadata.temperature is not None
+
+    # Use epsilon comparison to detect greedy sampling (temperature ~ 0.0)
+    # consistent with sampler.py's _SAMPLING_EPS threshold
+    temperature = sampling_metadata.temperature
+    # Avoid division by zero if there are greedy requests.
+    if not sampling_metadata.all_random:
+        is_greedy = temperature < _SAMPLING_EPS
+        temperature = torch.where(is_greedy, 1.0, temperature)
     logits.div_(temperature.view(-1, 1))
     probs = logits.softmax(dim=-1, dtype=torch.float32)
 
