@@ -136,6 +136,10 @@ class SpecDecodeBaseProposer:
         self.hidden_states = torch.zeros(
             (self.max_num_tokens, self.hidden_size), dtype=self.dtype, device=device
         )
+        self.query_start_loc = torch.zeros(
+            max_batch_size + 1, dtype=torch.int32, device=device
+        )
+        self.seq_lens = torch.zeros(max_batch_size, dtype=torch.int32, device=device)
 
         # We need +1 here because the arange is used to set query_start_loc,
         # which has one more element than batch_size.
@@ -482,9 +486,17 @@ class SpecDecodeBaseProposer:
                     max_model_len=self.runner.max_model_len,
                 )
             )
+            # copy attn_metadata to buffer for cudagraph
+            query_start_loc_len = len(attn_metadata.query_start_loc)
+            self.query_start_loc[:query_start_loc_len] = attn_metadata.query_start_loc
+            seq_lens_len = len(attn_metadata.seq_lens)
+            self.seq_lens[:seq_lens_len] = attn_metadata.seq_lens
+
             attn_metadata = attn_metadata.replace(
                 slot_mapping=new_slot_mapping,
                 block_table=new_block_table_tensor,
+                query_start_loc=self.query_start_loc[:query_start_loc_len],
+                seq_lens=self.seq_lens[:seq_lens_len],
             )
 
             for layer_name in self.attn_layer_names:
@@ -1161,11 +1173,20 @@ class SpecDecodeBaseProposer:
                     max_model_len=self.runner.max_model_len,
                 )
             )
+            # copy attn_metadata to buffer for cudagraph
+            one_attn_md = list(attn_metadata.values())[0]
+            query_start_loc_len = len(one_attn_md.query_start_loc)
+            self.query_start_loc[:query_start_loc_len] = one_attn_md.query_start_loc
+            seq_lens_len = len(one_attn_md.seq_lens)
+            self.seq_lens[:seq_lens_len] = one_attn_md.seq_lens
+
             new_attn_metadata = {}
             for layername, attn_md in attn_metadata.items():
                 new_attn_metadata[layername] = attn_md.replace(
                     slot_mapping=new_slot_mapping,
                     block_table=new_block_table_tensor,
+                    query_start_loc=self.query_start_loc[:query_start_loc_len],
+                    seq_lens=self.seq_lens[:seq_lens_len],
                 )
             attn_metadata = new_attn_metadata
 
