@@ -605,10 +605,37 @@ def test_extend_flat_seqs(device: str):
     new_vals = torch.tensor([14,
                              23,
                              32], device=device)
+    # the last values in each row have been inserted.
     expected_seqs = torch.tensor([11, 12, 13, 14,
                                   21, 22, 23,
                                   31, 32],
                                  device=device)
+    # fmt: on
+    actual_seqs = extend_flat_seqs(seqs, end_locs, new_vals)
+    assert torch.all(actual_seqs == expected_seqs)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_extend_flat_seqs_mrope(device: str):
+    """
+    Test that M-RoPe is also supported by extend_flat_seqs().
+    This is a special case of vectorization for extend_flat_seqs().
+    The seqs have shape [3, seq_len], the end_locs apply to all 3 dims of the seqs.
+    The new_vals are inserted in the corresponding dims.
+    """
+
+    # fmt: off
+    seqs = torch.tensor([[11, 12,   21],
+                         [31, 32,   41],
+                         [51, 52,   61]], device=device)
+    end_locs = torch.tensor([1, 2], device=device)
+    new_vals = torch.tensor([[13,   22], 
+                             [33,   42], 
+                             [53,   62]], device=device)
+    #                          insertions:  ↓         ↓ 
+    expected_seqs = torch.tensor([[11, 12, 13,   21, 22],
+                                  [31, 32, 33,   41, 42],
+                                  [51, 52, 53,   61, 62]], device=device)
     # fmt: on
     actual_seqs = extend_flat_seqs(seqs, end_locs, new_vals)
     assert torch.all(actual_seqs == expected_seqs)

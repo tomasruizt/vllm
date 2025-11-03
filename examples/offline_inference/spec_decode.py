@@ -75,6 +75,7 @@ def parse_args():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
     parser.add_argument("--disable-padded-drafter-batch", action="store_true")
     parser.add_argument("--max-num-seqs", type=int, default=None)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=None)
     return parser.parse_args()
 
 
@@ -155,6 +156,7 @@ def main(args):
         limit_mm_per_prompt={"image": 5},
         disable_chunked_mm_input=True,
         max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
     )
 
     sampling_params = SamplingParams(temperature=args.temp, max_tokens=args.output_len)

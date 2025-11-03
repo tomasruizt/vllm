@@ -219,11 +219,22 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
 
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+    def log_toks(self, msg: str, toks: torch.Tensor):
+        if self.do_log:
+            print(msg, [self.tokenizer.decode(tok) for tok in toks])
+
     def __init__(
         self,
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        self.do_log = True
+        if self.do_log:
+            from transformers import AutoTokenizer
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                vllm_config.model_config.model
+            )
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -2428,6 +2439,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        if self.do_log:
+            print("======== STEP =========")
         with record_function_or_nullcontext("Preprocess"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -2529,6 +2542,17 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        if inputs_embeds is not None:
+            print("tgt input embeds", inputs_embeds.shape)
+        else:
+            self.log_toks("tgt input toks", input_ids)
+        if self.do_log:
+            print("tgt positions", positions)
+            _atn_md = list(attn_metadata.values())[0]  # type: ignore
+            for idx, block_table in enumerate(_atn_md.block_table):
+                print(f"tgt block_table {idx}", block_table)
+            print("tgt slot_mapping", _atn_md.slot_mapping)
+            print("tgt query_start_loc", _atn_md.query_start_loc)
 
         with record_function_or_nullcontext("Postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -2593,6 +2617,9 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         with record_function_or_nullcontext("Sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+            if self.do_log:
+                for idx, toks in enumerate(sampler_output.sampled_token_ids):
+                    self.log_toks(f"sampled toks {idx}", toks[toks != -1])
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -4588,11 +4615,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
 
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
-        ):
-            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+        if self.speculative_config and self.speculative_config.use_eagle():
+            assert isinstance(self.drafter, EagleProposer)
             # validate all draft model layers belong to the same kv cache
             # group
             self.drafter.validate_same_kv_cache_group(kv_cache_config)
