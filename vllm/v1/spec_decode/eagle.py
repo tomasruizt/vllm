@@ -191,6 +191,25 @@ class SpecDecodeBaseProposer:
             dtype=torch.int32,
         ).repeat(max_batch_size, 1)
 
+        # filled lazily
+        self.layer2builder: dict[str, AttentionMetadataBuilder] = {}
+
+    def get_attn_metadata_builder(self, layer_name: str) -> AttentionMetadataBuilder:
+        if len(self.layer2builder) == 0:
+            self._fill_layer2builder()
+        return self.layer2builder[layer_name]
+
+    def _fill_layer2builder(self) -> None:
+        for kv_cache_group in self.runner.attn_groups:
+            for attn_group in kv_cache_group:
+                builder: AttentionMetadataBuilder = attn_group.get_metadata_builder()
+                for layer_name in attn_group.layer_names:
+                    if layer_name in self.layer2builder:
+                        raise ValueError(
+                            f"Multiple builders found for layer {layer_name}"
+                        )
+                    self.layer2builder[layer_name] = builder
+
     def _get_positions(self, num_tokens: int):
         if self.uses_mrope:
             return self.mrope_positions[:, :num_tokens]
@@ -236,14 +255,6 @@ class SpecDecodeBaseProposer:
 
         assert self.runner is not None
 
-        if self.attn_metadata_builder is None:
-            attn_metadata_builder = self._get_attention_metadata_builder()
-        else:
-            attn_metadata_builder = self.attn_metadata_builder
-
-        attn_metadata = attn_metadata_builder.build_for_drafting(
-            common_attn_metadata=common_attn_metadata, draft_index=0
-        )
         # FIXME: support hybrid kv for draft model (remove separate indexer)
         if self.draft_indexer_metadata_builder:
             draft_indexer_metadata = (
@@ -258,6 +269,10 @@ class SpecDecodeBaseProposer:
         # cache group, thus using the same attention metadata.
         per_layer_attn_metadata = {}
         for layer_name in self.attn_layer_names:
+            builder = self.get_attn_metadata_builder(layer_name)
+            attn_metadata = builder.build_for_drafting(
+                common_attn_metadata=common_attn_metadata, draft_index=0
+            )
             per_layer_attn_metadata[layer_name] = attn_metadata
 
         for layer_name in self.indexer_layer_names:
@@ -312,6 +327,14 @@ class SpecDecodeBaseProposer:
                 hidden_states = last_hidden_states
             else:
                 last_hidden_states, hidden_states = ret_hidden_states
+        self.runner.log_toks("draft input toks", model_kwargs["input_ids"])
+        if self.runner.do_log:
+            print("draft positions", model_kwargs["positions"])
+            _atn_md = list(per_layer_attn_metadata.values())[0]
+            for idx, block_table in enumerate(_atn_md.block_table):
+                print(f"block_table {idx}", block_table)
+            print("slot_mapping", _atn_md.slot_mapping)
+            print("query_start_loc", _atn_md.query_start_loc)
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states)
 
@@ -436,10 +459,13 @@ class SpecDecodeBaseProposer:
             )
 
             # Rebuild attention metadata
-            attn_metadata = attn_metadata_builder.build_for_drafting(  # type: ignore
-                common_attn_metadata=common_attn_metadata, draft_index=token_index + 1
-            )
+            per_layer_attn_metadata = {}
             for layer_name in self.attn_layer_names:
+                builder = self.get_attn_metadata_builder(layer_name)
+                attn_metadata = builder.build_for_drafting(
+                    common_attn_metadata=common_attn_metadata,
+                    draft_index=token_index + 1,
+                )
                 per_layer_attn_metadata[layer_name] = attn_metadata
 
             # copy inputs to buffer for cudagraph
@@ -478,6 +504,14 @@ class SpecDecodeBaseProposer:
                     hidden_states = ret_hidden_states
                 else:
                     last_hidden_states, hidden_states = ret_hidden_states
+            self.runner.log_toks("draft input toks", model_kwargs["input_ids"])
+            if self.runner.do_log:
+                print("draft positions", model_kwargs["positions"])
+                _atn_md = list(per_layer_attn_metadata.values())[0]
+                for idx, block_table in enumerate(_atn_md.block_table):
+                    print(f"block_table {idx}", block_table)
+                print("slot_mapping", _atn_md.slot_mapping)
+                print("query_start_loc", _atn_md.query_start_loc)
 
             hidden_states = hidden_states[:batch_size]
             logits = self.model.compute_logits(last_hidden_states[:batch_size])

@@ -219,11 +219,22 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
 
 
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
+    def log_toks(self, msg: str, toks: torch.Tensor):
+        if self.do_log:
+            print(msg, [self.tokenizer.decode(tok) for tok in toks])
+
     def __init__(
         self,
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        self.do_log = True
+        if self.do_log:
+            from transformers import AutoTokenizer
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                vllm_config.model_config.model
+            )
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -2428,6 +2439,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        if self.do_log:
+            print("======== STEP =========")
         with record_function_or_nullcontext("Preprocess"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
@@ -2529,6 +2542,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+        self.log_toks("tgt input toks", input_ids)
+        if self.do_log:
+            print("tgt positions", positions)
+            _atn_md = list(attn_metadata.values())[0]  # type: ignore
+            for idx, block_table in enumerate(_atn_md.block_table):
+                print(f"tgt block_table {idx}", block_table)
+            print("tgt slot_mapping", _atn_md.slot_mapping)
+            print("tgt query_start_loc", _atn_md.query_start_loc)
 
         with record_function_or_nullcontext("Postprocess"):
             if self.use_aux_hidden_state_outputs:
