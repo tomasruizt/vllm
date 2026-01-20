@@ -321,6 +321,13 @@ class GPUModelRunner(
         vllm_config: VllmConfig,
         device: torch.device,
     ):
+        self.do_log = True
+        if self.do_log:
+            from transformers import AutoTokenizer
+
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                vllm_config.model_config.model
+            )
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
         self.cache_config = vllm_config.cache_config
@@ -3308,6 +3315,9 @@ class GPUModelRunner(
                 inputs_embeds=inputs_embeds,
                 **model_kwargs,
             )
+            self.log_toks("tgt inputs", input_ids)
+            if self.do_log:
+                print("tgt positions", positions)
 
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
             if self.use_aux_hidden_state_outputs:
@@ -3426,6 +3436,9 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+            if self.do_log:
+                for idx, toks in enumerate(sampler_output.sampled_token_ids):
+                    self.log_toks(f"sampled toks [{idx}]", toks[toks != -1])
 
         self._draft_token_ids = None
         self._draft_token_req_ids = None

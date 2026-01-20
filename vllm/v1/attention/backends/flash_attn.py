@@ -216,6 +216,9 @@ class FlashAttentionMetadata:
 
     causal: bool = True
 
+    def replace(self, **kwargs) -> "FlashAttentionMetadata":
+        return replace(self, **kwargs)
+
 
 def _get_sliding_window_configs(
     vllm_config: VllmConfig,
