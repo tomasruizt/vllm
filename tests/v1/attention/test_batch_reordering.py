@@ -53,7 +53,7 @@ REORDER_TEST_CASES = {
         expected_modified=True,
     ),
     "already_ordered": ReorderTestCase(
-        requests=[(1, 10), (1, 20), (100, 100), (200, 200)],
+        requests=[(1, 10), (1, 20), (100, 100), (200, 0)],
         expected_order=[0, 1, 2, 3],
         expected_modified=False,
     ),
@@ -74,13 +74,49 @@ REORDER_TEST_CASES = {
         expected_modified=True,
     ),
     "decode_extend_prefill": ReorderTestCase(
-        requests=[(100, 100), (10, 50), (1, 10)],
+        requests=[(100, 0), (10, 50), (1, 10)],
         expected_order=[2, 1, 0],
         expected_modified=True,
     ),
     "extend_prefill_only": ReorderTestCase(
-        requests=[(100, 100), (10, 50), (200, 200), (20, 75)],
+        requests=[(100, 0), (10, 50), (200, 0), (20, 75)],
         expected_order=[3, 1, 2, 0],  # Only swap 0↔3, keep 1 and 2 in place
+        expected_modified=True,
+    ),
+    "complicated_mixed_interleaved": ReorderTestCase(
+        requests=[
+            (1, 20),
+            (1, 50),
+            (374, 0),
+            (300, 20),
+            (1, 20),
+            (256, 0),
+            (1, 5),
+            (27, 0),
+            (1, 4),
+        ],
+        expected_order=[0, 1, 6, 8, 4, 3, 2, 7, 5],
+        expected_modified=True,
+    ),
+    "new_request_single_token_prefill": ReorderTestCase(
+        requests=[
+            (100, 0),
+            (1, 0),  # New request with only 1 token (STILL prefill)
+            (50, 100),
+            (1, 10),
+        ],
+        # Only index 3 is a true decode (has num_computed_tokens > 0)
+        expected_order=[3, 2, 0, 1],
+        expected_modified=True,
+    ),
+    "multiple_new_requests_single_token_prefill": ReorderTestCase(
+        requests=[
+            (1, 0),  # New prefill (1 token, no computed)
+            (1, 0),  # New prefill (1 token, no computed)
+            (1, 50),
+            (200, 0),
+        ],
+        expected_order=[2, 1, 0, 3],
         expected_modified=True,
     ),
 }
