@@ -7,7 +7,7 @@ import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.speculative import SpeculativeConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import (
@@ -38,9 +38,9 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         self._raise_if_vocab_size_mismatch()
         self._raise_if_draft_tp_mismatch()
 
-    def _block_size(self) -> int:
-        builder = self._get_attention_metadata_builder()
-        return builder.kv_cache_spec.block_size
+    def _block_size(self, kv_cache_gid: int) -> int:
+        builders = self._get_attention_metadata_builders()
+        return builders[kv_cache_gid].kv_cache_spec.block_size
 
     def _raise_if_multimodal(self):
         if self.supports_mm_inputs:
@@ -91,6 +91,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         last_token_indices: torch.Tensor | None,
         cad: CommonAttentionMetadata,
         num_rejected_tokens_gpu: torch.Tensor | None,
+        block_tables_by_gid: dict[int, torch.Tensor] | None = None,
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
         batch_size = cad.batch_size()
         grid = (batch_size,)
@@ -127,14 +128,32 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             rejected_tok_fill=0,
         )
 
-        # recompute slot mapping
-        new_slot_mapping = compute_new_slot_mapping(
-            cad=cad,
-            new_positions=self.positions[:num_tokens],
-            is_rejected_token_mask=is_rejected_tok,
-            block_size=self._block_size(),
-            max_model_len=self.max_model_len,
-        )
+        # Compute slot mappings for all draft KV cache groups
+        # Use target model's block tables when available (from block_tables_by_gid)
+        self._multi_group_slot_mappings: dict[int, torch.Tensor] = {}
+
+        for kv_cache_gid in self._draft_kv_cache_group_ids:
+            # Prefer target model's block tables passed via block_tables_by_gid
+            if block_tables_by_gid is not None and kv_cache_gid in block_tables_by_gid:
+                blk_table_tensor = block_tables_by_gid[kv_cache_gid]
+            else:
+                blk_table = self.runner.input_batch.block_table[kv_cache_gid]
+                blk_table_tensor = blk_table.get_device_tensor(batch_size)
+            block_size = self._block_size(kv_cache_gid)
+            slot_mapping = compute_new_slot_mapping(
+                cad=cad,
+                new_positions=self.positions[:num_tokens],
+                is_rejected_token_mask=is_rejected_tok,
+                block_size=block_size,
+                max_model_len=self.max_model_len,
+                block_table_tensor=blk_table_tensor,
+            )
+            self._multi_group_slot_mappings[kv_cache_gid] = slot_mapping
+
+        # Use first group's slot_mapping for new_cad
+        first_gid = self._draft_kv_cache_group_ids[0]
+        new_slot_mapping = self._multi_group_slot_mappings[first_gid]
+
         # update common_attn_metadata
         new_cad: CommonAttentionMetadata = extend_all_queries_by_1(
             cad,
@@ -154,7 +173,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         # This must be computed before loading the draft model
         # because that mutates the forward_context of the vllm_config
         target_attn_layer_names = set(
-            get_layers_from_vllm_config(self.vllm_config, Attention).keys()
+            get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase).keys()
         )
 
         from vllm.compilation.backends import set_model_tag
@@ -174,10 +193,12 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         # This must be computed after loading the draft model
         # because that mutates the forward_context of the vllm_config
         draft_attn_layer_names = (
-            get_layers_from_vllm_config(self.vllm_config, Attention).keys()
+            get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase).keys()
             - target_attn_layer_names
         )
         self.attn_layer_names = list(draft_attn_layer_names)
+        # Note: _init_kv_cache_group_mapping() is called lazily in propose()
+        # after initialize_kv_cache() populates self.runner.attn_groups
 
 
 def create_vllm_config_for_draft_model(
@@ -207,8 +228,25 @@ def compute_new_slot_mapping(
     is_rejected_token_mask: torch.Tensor,
     block_size: int,
     max_model_len: int,
+    block_table_tensor: torch.Tensor | None = None,
 ):
-    batch_size, n_blocks_per_req = cad.block_table_tensor.shape
+    """Compute slot mapping for draft positions.
+
+    Args:
+        cad: Common attention metadata (used for query_start_loc and
+            block_table_tensor if not provided separately)
+        new_positions: New position ids for tokens
+        is_rejected_token_mask: Mask for rejected tokens
+        block_size: Block size for KV cache
+        max_model_len: Maximum model length
+        block_table_tensor: Optional block table tensor. If None, uses
+            cad.block_table_tensor. This parameter allows computing
+            slot_mapping for different KV cache groups.
+    """
+    if block_table_tensor is None:
+        block_table_tensor = cad.block_table_tensor
+
+    batch_size, n_blocks_per_req = block_table_tensor.shape
     req_indices = torch.arange(batch_size, device=cad.query_start_loc.device)
     req_indices = torch.repeat_interleave(
         req_indices, cad.naive_query_lens() + 1, output_size=len(new_positions)
@@ -219,7 +257,7 @@ def compute_new_slot_mapping(
     block_table_indices = (
         req_indices * n_blocks_per_req + clamped_positions // block_size
     )
-    block_nums = cad.block_table_tensor.view(-1)[block_table_indices]
+    block_nums = block_table_tensor.view(-1)[block_table_indices]
     block_offsets = clamped_positions % block_size
     new_slot_mapping = block_nums * block_size + block_offsets
     # Mask out the position ids that exceed the max model length.

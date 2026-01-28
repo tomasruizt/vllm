@@ -652,6 +652,15 @@ cases = [
         expected_acceptance_len=2.8 + 1,
         expected_acceptance_rate=0.9,
     ),
+    # Multiple KV Cache groups
+    ArgsTest(
+        target_model="google/gemma-3-270m-it",
+        draft_model="google/gemma-3-270m-it",
+        sampling_config=greedy_sampling(),
+        num_speculative_tokens=3,
+        expected_acceptance_len=3 + 1,
+        expected_acceptance_rate=1.0,
+    ),
 ]
 
 
