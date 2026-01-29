@@ -261,31 +261,25 @@ class SpecDecodeBaseProposer:
     ) -> dict[str, torch.Tensor]:
         """Return slot_mapping dict for EAGLE/draft layers.
 
-        For multi-group KV cache models, returns per-layer slot mappings
-        based on each layer's KV cache group.
+        Always uses per-group slot mappings: single-group is the special case
+        with one entry in _multi_group_slot_mappings. When the dict is not yet
+        populated (e.g. during cudagraph capture), falls back to the passed
+        slot_mapping and shared buffer.
         """
-        # If we have multi-group slot mappings, use them per-layer
-        use_multi_group = (
-            self._multi_group_slot_mappings and self._layer_to_kv_cache_group
-        )
-        if use_multi_group:
-            result = {}
+        if self._multi_group_slot_mappings and self._draft_kv_cache_group_ids:
+            first_gid = self._draft_kv_cache_group_ids[0]
+            result: dict[str, torch.Tensor] = {}
             for layer_name in self.attn_layer_names:
-                gid = self._layer_to_kv_cache_group.get(layer_name, 0)
-                if gid in self._multi_group_slot_mappings:
-                    result[layer_name] = self._multi_group_slot_mappings[gid]
-                else:
-                    # Fallback to first group
-                    first_gid = list(self._multi_group_slot_mappings.keys())[0]
-                    result[layer_name] = self._multi_group_slot_mappings[first_gid]
-            # Use first group for indexer layers
-            if self._multi_group_slot_mappings:
-                first_gid = list(self._multi_group_slot_mappings.keys())[0]
-                for layer_name in self.indexer_layer_names:
-                    result[layer_name] = self._multi_group_slot_mappings[first_gid]
+                gid = self._layer_to_kv_cache_group.get(layer_name, first_gid)
+                sm = self._multi_group_slot_mappings.get(gid)
+                if sm is None:
+                    sm = self._multi_group_slot_mappings[first_gid]
+                result[layer_name] = sm
+            for layer_name in self.indexer_layer_names:
+                result[layer_name] = self._multi_group_slot_mappings[first_gid]
             return result
 
-        # Single-group fallback
+        # Fallback when dict not yet populated (e.g. cudagraph capture)
         if slot_mapping is not None:
             num_actual = slot_mapping.shape[0]
             self._slot_mapping_buffer[:num_actual].copy_(slot_mapping)
@@ -401,15 +395,11 @@ class SpecDecodeBaseProposer:
                 blk_table = self.runner.input_batch.block_table[kv_cache_gid]
                 blk_table_tensor = blk_table.get_device_tensor(num_reqs)
 
-            # Use stored slot_mappings if available (from DraftModelProposer)
-            has_multi_group = hasattr(self, "_multi_group_slot_mappings")
-            has_gid = (
-                has_multi_group and kv_cache_gid in self._multi_group_slot_mappings
+            # Use stored per-group slot mapping or target's slot_mapping (first pass)
+            slot_mapping = self._multi_group_slot_mappings.get(
+                kv_cache_gid, common_attn_metadata.slot_mapping
             )
-            if has_gid:
-                slot_mapping = self._multi_group_slot_mappings[kv_cache_gid]
-            else:
-                slot_mapping = common_attn_metadata.slot_mapping
+            self._multi_group_slot_mappings[kv_cache_gid] = slot_mapping
 
             cm = replace(
                 common_attn_metadata,
@@ -426,10 +416,6 @@ class SpecDecodeBaseProposer:
             for layer_name in self.attn_layer_names:
                 if self._layer_to_kv_cache_group.get(layer_name) == kv_cache_gid:
                     per_layer_attn_metadata[layer_name] = attn_metadata
-
-        # Store the first builder for backward compatibility (used in later loops)
-        first_gid = self._draft_kv_cache_group_ids[0]
-        attn_metadata_builder = attn_metadata_builders[first_gid]
 
         # FIXME: support hybrid kv for draft model (remove separate indexer)
         if self.draft_indexer_metadata_builder:
@@ -629,107 +615,69 @@ class SpecDecodeBaseProposer:
             if common_attn_metadata._num_computed_tokens_cpu is not None:
                 common_attn_metadata._num_computed_tokens_cpu += 1
 
-            # Compute the slot mapping and rebuild attention metadata.
-            # For multi-group, we compute per-group slot mappings.
-            block_size = attn_metadata_builder.kv_cache_spec.block_size
-            if self.uses_mrope:
-                # all dimensions of positions are the same
-                block_numbers = clamped_positions[0] // block_size
-            else:
-                block_numbers = clamped_positions // block_size
+            # Compute per-group slot mappings and rebuild attention metadata.
+            # Single group = one entry in _draft_kv_cache_group_ids.
+            for gid_idx, kv_cache_gid in enumerate(self._draft_kv_cache_group_ids):
+                # Use target model's block tables when available
+                if (
+                    self._block_tables_by_gid is not None
+                    and kv_cache_gid in self._block_tables_by_gid
+                ):
+                    blk_table_tensor = self._block_tables_by_gid[kv_cache_gid]
+                elif gid_idx == 0:
+                    blk_table_tensor = common_attn_metadata.block_table_tensor
+                else:
+                    blk_table = self.runner.input_batch.block_table[kv_cache_gid]
+                    blk_table_tensor = blk_table.get_device_tensor(
+                        common_attn_metadata.num_reqs
+                    )
 
-            if len(self._draft_kv_cache_group_ids) == 1:
-                # Single group: use original logic
-                block_ids = common_attn_metadata.block_table_tensor.gather(
-                    dim=1, index=block_numbers.view(-1, 1)
+                # Compute per-group block_size and block_numbers
+                builder = attn_metadata_builders[kv_cache_gid]
+                group_block_size = builder.kv_cache_spec.block_size
+                if self.uses_mrope:
+                    group_block_numbers = clamped_positions[0] // group_block_size
+                else:
+                    group_block_numbers = clamped_positions // group_block_size
+
+                block_ids = blk_table_tensor.gather(
+                    dim=1, index=group_block_numbers.view(-1, 1)
                 )
                 block_ids = block_ids.view(-1)
                 if self.uses_mrope:
-                    common_attn_metadata.slot_mapping = (
-                        block_ids * block_size + clamped_positions[0] % block_size
+                    slot_mapping = (
+                        block_ids * group_block_size
+                        + clamped_positions[0] % group_block_size
                     )
                 else:
-                    common_attn_metadata.slot_mapping = (
-                        block_ids * block_size + clamped_positions % block_size
+                    slot_mapping = (
+                        block_ids * group_block_size
+                        + clamped_positions % group_block_size
                     )
-                # Mask out the slot mappings that exceed the max model length.
-                common_attn_metadata.slot_mapping.masked_fill_(
-                    exceeds_max_model_len, PADDING_SLOT_ID
+                slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+
+                # Store for use by _get_slot_mapping()
+                self._multi_group_slot_mappings[kv_cache_gid] = slot_mapping
+
+                # Update common_attn_metadata for first group (for consistency)
+                if gid_idx == 0:
+                    common_attn_metadata.slot_mapping = slot_mapping
+                    cm = common_attn_metadata
+                else:
+                    cm = replace(
+                        common_attn_metadata,
+                        block_table_tensor=blk_table_tensor,
+                        slot_mapping=slot_mapping,
+                    )
+
+                builder = attn_metadata_builders[kv_cache_gid]
+                attn_metadata = builder.build_for_drafting(
+                    common_attn_metadata=cm, draft_index=token_index + 1
                 )
 
-                # Rebuild attention metadata
-                attn_metadata = attn_metadata_builder.build_for_drafting(
-                    common_attn_metadata=common_attn_metadata,
-                    draft_index=token_index + 1,
-                )
                 for layer_name in self.attn_layer_names:
-                    per_layer_attn_metadata[layer_name] = attn_metadata
-            else:
-                # Multi-group: compute per-group slot mappings and build metadata
-                for gid_idx, kv_cache_gid in enumerate(self._draft_kv_cache_group_ids):
-                    # Use target model's block tables when available
-                    if (
-                        self._block_tables_by_gid is not None
-                        and kv_cache_gid in self._block_tables_by_gid
-                    ):
-                        blk_table_tensor = self._block_tables_by_gid[kv_cache_gid]
-                    elif gid_idx == 0:
-                        blk_table_tensor = common_attn_metadata.block_table_tensor
-                    else:
-                        blk_table = self.runner.input_batch.block_table[kv_cache_gid]
-                        blk_table_tensor = blk_table.get_device_tensor(
-                            common_attn_metadata.num_reqs
-                        )
-
-                    # Compute per-group block_size and block_numbers
-                    builder = attn_metadata_builders[kv_cache_gid]
-                    group_block_size = builder.kv_cache_spec.block_size
-                    if self.uses_mrope:
-                        group_block_numbers = clamped_positions[0] // group_block_size
-                    else:
-                        group_block_numbers = clamped_positions // group_block_size
-
-                    block_ids = blk_table_tensor.gather(
-                        dim=1, index=group_block_numbers.view(-1, 1)
-                    )
-                    block_ids = block_ids.view(-1)
-                    if self.uses_mrope:
-                        slot_mapping = (
-                            block_ids * group_block_size
-                            + clamped_positions[0] % group_block_size
-                        )
-                    else:
-                        slot_mapping = (
-                            block_ids * group_block_size
-                            + clamped_positions % group_block_size
-                        )
-                    slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
-
-                    # Store for use by _get_slot_mapping()
-                    self._multi_group_slot_mappings[kv_cache_gid] = slot_mapping
-
-                    # Update common_attn_metadata for first group (for consistency)
-                    if gid_idx == 0:
-                        common_attn_metadata.slot_mapping = slot_mapping
-                        cm = common_attn_metadata
-                    else:
-                        cm = replace(
-                            common_attn_metadata,
-                            block_table_tensor=blk_table_tensor,
-                            slot_mapping=slot_mapping,
-                        )
-
-                    builder = attn_metadata_builders[kv_cache_gid]
-                    attn_metadata = builder.build_for_drafting(
-                        common_attn_metadata=cm, draft_index=token_index + 1
-                    )
-
-                    for layer_name in self.attn_layer_names:
-                        if (
-                            self._layer_to_kv_cache_group.get(layer_name)
-                            == kv_cache_gid
-                        ):
-                            per_layer_attn_metadata[layer_name] = attn_metadata
+                    if self._layer_to_kv_cache_group.get(layer_name) == kv_cache_gid:
+                        per_layer_attn_metadata[layer_name] = attn_metadata
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
