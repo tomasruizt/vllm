@@ -350,8 +350,6 @@ class SpecDecodeBaseProposer:
         slot_mappings: dict[str, torch.Tensor]
         | list[dict[str, torch.Tensor]]
         | None = None,
-        # Block tables per KV cache group (for multi-group models)
-        block_tables_by_gid: dict[int, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         batch_size = common_attn_metadata.batch_size()
 
@@ -364,7 +362,9 @@ class SpecDecodeBaseProposer:
 
         assert self.runner is not None
 
-        # Store block_tables_by_gid for use in subsequent draft iterations
+        # Block tables per KV cache group (from CommonAttentionMetadata)
+        block_tables_by_gid = common_attn_metadata.block_tables_by_gid
+        assert isinstance(block_tables_by_gid, dict)
         self._block_tables_by_gid = block_tables_by_gid
 
         # Lazy initialization of KV cache group mapping
@@ -381,7 +381,6 @@ class SpecDecodeBaseProposer:
                 last_token_indices=last_token_indices,
                 cad=common_attn_metadata,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                block_tables_by_gid=block_tables_by_gid,
             )
         )
 
@@ -788,7 +787,6 @@ class SpecDecodeBaseProposer:
         last_token_indices: torch.Tensor | None,
         cad: CommonAttentionMetadata,
         num_rejected_tokens_gpu: torch.Tensor | None,
-        block_tables_by_gid: dict[int, torch.Tensor] | None = None,
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
         if last_token_indices is None:
             last_token_indices = cad.query_start_loc[1:] - 1
@@ -953,6 +951,7 @@ class SpecDecodeBaseProposer:
             max_seq_len=common_attn_metadata.seq_lens_cpu.max().item(),
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
+            block_tables_by_gid=common_attn_metadata.block_tables_by_gid,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
@@ -1232,6 +1231,7 @@ class SpecDecodeBaseProposer:
             max_seq_len=new_seq_lens_cpu.max().item(),
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[token_indices],
+            block_tables_by_gid=common_attn_metadata.block_tables_by_gid,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )

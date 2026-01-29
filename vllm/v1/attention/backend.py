@@ -312,6 +312,10 @@ class CommonAttentionMetadata:
     block_table_tensor: torch.Tensor
     slot_mapping: torch.Tensor
 
+    # For multi-group KV cache (e.g. speculative decoding): block tables per group.
+    # When set, drafter uses these instead of a single block_table_tensor.
+    block_tables_by_gid: dict[int, torch.Tensor] | None = None
+
     causal: bool = True
 
     # Needed by FastPrefillAttentionBuilder
@@ -400,6 +404,14 @@ class CommonAttentionMetadata:
             max_seq_len=self.max_seq_len,
             block_table_tensor=self.block_table_tensor[:num_actual_reqs],
             slot_mapping=self.slot_mapping[:num_actual_tokens],
+            block_tables_by_gid=(
+                {
+                    gid: t[:num_actual_reqs]
+                    for gid, t in self.block_tables_by_gid.items()
+                }
+                if self.block_tables_by_gid is not None
+                else None
+            ),
             causal=self.causal,
             logits_indices_padded=self.logits_indices_padded,
             num_logits_indices=self.num_logits_indices,

@@ -91,7 +91,6 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         last_token_indices: torch.Tensor | None,
         cad: CommonAttentionMetadata,
         num_rejected_tokens_gpu: torch.Tensor | None,
-        block_tables_by_gid: dict[int, torch.Tensor] | None = None,
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
         batch_size = cad.batch_size()
         grid = (batch_size,)
@@ -129,11 +128,13 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         )
 
         # Compute slot mappings for all draft KV cache groups
-        # Use target model's block tables when available (from block_tables_by_gid)
+        # Use target model's block tables when available (from cad.block_tables_by_gid)
         self._multi_group_slot_mappings: dict[int, torch.Tensor] = {}
+        block_tables_by_gid = cad.block_tables_by_gid
+        assert isinstance(block_tables_by_gid, dict)
 
         for kv_cache_gid in self._draft_kv_cache_group_ids:
-            # Prefer target model's block tables passed via block_tables_by_gid
+            # Prefer target model's block tables from CommonAttentionMetadata
             if block_tables_by_gid is not None and kv_cache_gid in block_tables_by_gid:
                 blk_table_tensor = block_tables_by_gid[kv_cache_gid]
             else:
