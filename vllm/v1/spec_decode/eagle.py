@@ -376,15 +376,7 @@ class SpecDecodeBaseProposer:
         per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
 
         for kv_cache_gid in draft_kv_cache_group_ids:
-            num_reqs = common_attn_metadata.num_reqs
-
-            # Get block table for this group - prefer passed block tables from
-            # target model over draft runner's block tables
-            if block_tables_by_gid is not None and kv_cache_gid in block_tables_by_gid:
-                blk_table_tensor = block_tables_by_gid[kv_cache_gid]
-            else:
-                blk_table = self.runner.input_batch.block_table[kv_cache_gid]
-                blk_table_tensor = blk_table.get_device_tensor(num_reqs)
+            blk_table_tensor = block_tables_by_gid[kv_cache_gid]
 
             # First pass: use extended slot mappings from set_inputs_first_pass.
             slot_mapping = self._multi_group_slot_mappings[kv_cache_gid]
@@ -608,19 +600,7 @@ class SpecDecodeBaseProposer:
 
             # Compute per-group slot mappings and rebuild attention metadata.
             for gid_idx, kv_cache_gid in enumerate(draft_kv_cache_group_ids):
-                # Use target model's block tables when available
-                if (
-                    self._block_tables_by_gid is not None
-                    and kv_cache_gid in self._block_tables_by_gid
-                ):
-                    blk_table_tensor = self._block_tables_by_gid[kv_cache_gid]
-                elif gid_idx == 0:
-                    blk_table_tensor = common_attn_metadata.block_table_tensor
-                else:
-                    blk_table = self.runner.input_batch.block_table[kv_cache_gid]
-                    blk_table_tensor = blk_table.get_device_tensor(
-                        common_attn_metadata.num_reqs
-                    )
+                blk_table_tensor = self._block_tables_by_gid[kv_cache_gid]
 
                 # Compute per-group block_size and block_numbers
                 group_block_size = block_size_by_gid[kv_cache_gid]

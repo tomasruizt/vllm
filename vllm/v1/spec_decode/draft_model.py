@@ -141,12 +141,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             )
         )
         for kv_cache_gid in draft_kv_cache_group_ids:
-            # Prefer target model's block tables from CommonAttentionMetadata
-            if block_tables_by_gid is not None and kv_cache_gid in block_tables_by_gid:
-                blk_table_tensor = block_tables_by_gid[kv_cache_gid]
-            else:
-                blk_table = self.runner.input_batch.block_table[kv_cache_gid]
-                blk_table_tensor = blk_table.get_device_tensor(batch_size)
+            blk_table_tensor = block_tables_by_gid[kv_cache_gid]
             block_size = block_size_by_gid[kv_cache_gid]
             slot_mapping = compute_new_slot_mapping(
                 cad=cad,
