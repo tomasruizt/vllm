@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import ast
+from collections import defaultdict
 from dataclasses import replace
 from importlib.util import find_spec
 
@@ -167,8 +168,10 @@ class SpecDecodeBaseProposer:
             with_numpy=True,
         )
 
-        # Initialize per-gid slot-mapping buffers lazily.
-        self._slot_mapping_buffer_by_gid: dict[int, torch.Tensor] = {}
+        # Per-gid slot-mapping buffers (lazily created via defaultdict).
+        self._slot_mapping_buffer_by_gid: defaultdict[int, torch.Tensor] = defaultdict(
+            self.new_slot_mapping_buffer
+        )
 
         # Multi-KV-cache-group: layer_to_kv_cache_gid / draft_kv_cache_group_ids
         # from CommonAttentionMetadata in propose()
@@ -250,16 +253,15 @@ class SpecDecodeBaseProposer:
                 positions = positions[0]
             self.positions[:num_tokens] = positions
 
-    def _ensure_slot_mapping_buffer(self, gid: int) -> torch.Tensor:
-        """Lazily allocate and return the slot-mapping buffer for the given gid."""
-        if gid not in self._slot_mapping_buffer_by_gid:
-            device = self.hidden_states.device
-            self._slot_mapping_buffer_by_gid[gid] = torch.zeros(
-                self.max_num_tokens, dtype=torch.int64, device=device
-            )
-        return self._slot_mapping_buffer_by_gid[gid]
+    def new_slot_mapping_buffer(self) -> torch.Tensor:
+        """Create a new slot-mapping buffer for one KV cache group."""
+        return torch.zeros(
+            self.max_num_tokens,
+            dtype=torch.int64,
+            device=self.hidden_states.device,
+        )
 
-    def _get_slot_mapping_for_inference(
+    def _get_slot_mapping_buffer_for_inference(
         self,
         num_tokens: int,
         layer_to_kv_cache_gid: dict[str, int],
@@ -271,40 +273,32 @@ class SpecDecodeBaseProposer:
         Copies per-group slot mappings from CommonAttentionMetadata into
         per-gid buffers and returns views into those buffers.
         """
-        first_gid = draft_kv_cache_group_ids[0]
+        # COPY
         for gid in draft_kv_cache_group_ids:
-            buf = self._ensure_slot_mapping_buffer(gid)
+            buf = self._slot_mapping_buffer_by_gid[gid]
             src = slot_mapping_by_gid[gid]
             n = min(num_tokens, src.shape[0])
             buf[:n].copy_(src[:n])
             if n < num_tokens:
                 buf[n:num_tokens].fill_(PADDING_SLOT_ID)
-        result: dict[str, torch.Tensor] = {}
-        for layer_name in self.attn_layer_names:
-            gid = layer_to_kv_cache_gid.get(layer_name, first_gid)
-            result[layer_name] = self._slot_mapping_buffer_by_gid[gid][:num_tokens]
-        for layer_name in self.indexer_layer_names:
-            result[layer_name] = self._slot_mapping_buffer_by_gid[first_gid][
-                :num_tokens
-            ]
-        return result
 
-    def _get_slot_mapping_for_dummy_run(
-        self,
-        num_tokens: int,
-        slot_mapping: torch.Tensor | None = None,
+        # READ
+        layer_to_buffer: dict[str, torch.Tensor] = {}
+        layer_names = [*self.attn_layer_names, *self.indexer_layer_names]
+        for layer_name in layer_names:
+            gid = layer_to_kv_cache_gid[layer_name]
+            buf = self._slot_mapping_buffer_by_gid[gid][:num_tokens]
+            layer_to_buffer[layer_name] = buf
+
+        return layer_to_buffer
+
+    def _get_slot_mapping_buffers_for_dummy_run(
+        self, num_tokens: int
     ) -> dict[str, torch.Tensor]:
         """Return slot_mapping dict for EAGLE/draft layers during dummy run.
-
-        No CommonAttentionMetadata; uses per-gid buffer (gid 0) and optional
-        slot_mapping.
+        Uses per-gid buffer (gid 0).
         """
-        buf = self._ensure_slot_mapping_buffer(0)
-        if slot_mapping is not None:
-            num_actual = slot_mapping.shape[0]
-            buf[:num_actual].copy_(slot_mapping)
-            if num_tokens > num_actual:
-                buf[num_actual:num_tokens].fill_(PADDING_SLOT_ID)
+        buf = self._slot_mapping_buffer_by_gid[0]
         view = buf[:num_tokens]
         return {name: view for name in self.attn_layer_names + self.indexer_layer_names}
 
@@ -471,7 +465,7 @@ class SpecDecodeBaseProposer:
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
-            slot_mapping=self._get_slot_mapping_for_inference(
+            slot_mapping=self._get_slot_mapping_buffer_for_inference(
                 num_tokens=num_input_tokens,
                 layer_to_kv_cache_gid=layer_to_kv_cache_gid,
                 draft_kv_cache_group_ids=draft_kv_cache_group_ids,
@@ -690,7 +684,7 @@ class SpecDecodeBaseProposer:
                 num_tokens=input_batch_size,
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
-                slot_mapping=self._get_slot_mapping_for_inference(
+                slot_mapping=self._get_slot_mapping_buffer_for_inference(
                     num_tokens=input_batch_size,
                     layer_to_kv_cache_gid=layer_to_kv_cache_gid,
                     draft_kv_cache_group_ids=draft_kv_cache_group_ids,
@@ -1047,7 +1041,7 @@ class SpecDecodeBaseProposer:
                 self.vllm_config,
                 num_tokens=num_input_tokens,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
-                slot_mapping=self._get_slot_mapping_for_inference(
+                slot_mapping=self._get_slot_mapping_buffer_for_inference(
                     num_tokens=num_input_tokens,
                     layer_to_kv_cache_gid=layer_to_kv_cache_gid,
                     draft_kv_cache_group_ids=draft_kv_cache_group_ids,
@@ -1173,11 +1167,7 @@ class SpecDecodeBaseProposer:
         token_indices_np = token_offests + old_query_start_locs_expanded
         token_indices = torch.from_numpy(token_indices_np).to(device, non_blocking=True)
 
-        slot_mapping_by_gid_raw = common_attn_metadata.slot_mapping_by_gid
-        assert isinstance(slot_mapping_by_gid_raw, dict)
-        slot_mapping_by_gid = {
-            gid: t[token_indices] for gid, t in slot_mapping_by_gid_raw.items()
-        }
+        assert isinstance(common_attn_metadata.slot_mapping_by_gid, dict)
         spec_common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=new_query_start_loc_cpu.to(device, non_blocking=True),
             seq_lens=new_seq_lens_cpu.to(device, non_blocking=True),
@@ -1191,7 +1181,10 @@ class SpecDecodeBaseProposer:
             block_table_tensor=torch.empty(0),  # block_table_tensor is set in propose()
             slot_mapping=torch.empty(0),  # slot_mapping is set in propose()
             block_tables_by_gid=common_attn_metadata.block_tables_by_gid,
-            slot_mapping_by_gid=slot_mapping_by_gid,
+            slot_mapping_by_gid={
+                gid: t[token_indices]
+                for gid, t in common_attn_metadata.slot_mapping_by_gid.items()
+            },
             layer_to_kv_cache_gid=common_attn_metadata.layer_to_kv_cache_gid,
             block_size_by_gid=common_attn_metadata.block_size_by_gid,
             causal=True,
@@ -1423,7 +1416,7 @@ class SpecDecodeBaseProposer:
                 and slot_mappings is not None
                 and self.attn_layer_names[0] in slot_mappings
             ):
-                slot_mapping_dict = self._get_slot_mapping_for_dummy_run(
+                slot_mapping_dict = self._get_slot_mapping_buffers_for_dummy_run(
                     num_tokens=num_input_tokens
                 )
             else:
