@@ -167,14 +167,12 @@ class SpecDecodeBaseProposer:
             with_numpy=True,
         )
 
-        self._slot_mapping_buffer = torch.zeros(
-            self.max_num_tokens, dtype=torch.int64, device=device
-        )
+        # Initialize per-gid slot-mapping buffers lazily.
+        self._slot_mapping_buffer_by_gid: dict[int, torch.Tensor] = {}
 
         # Multi-KV-cache-group: layer_to_kv_cache_gid / draft_kv_cache_group_ids
         # from CommonAttentionMetadata in propose()
         self._attn_metadata_builders: dict[int, AttentionMetadataBuilder] = {}
-        self._multi_group_slot_mappings: dict[int, torch.Tensor] = {}
         self._block_tables_by_gid: dict[int, torch.Tensor] | None = None
 
         # Determine allowed attention backends once during initialization.
@@ -252,44 +250,62 @@ class SpecDecodeBaseProposer:
                 positions = positions[0]
             self.positions[:num_tokens] = positions
 
-    def _get_slot_mapping(
+    def _ensure_slot_mapping_buffer(self, gid: int) -> torch.Tensor:
+        """Lazily allocate and return the slot-mapping buffer for the given gid."""
+        if gid not in self._slot_mapping_buffer_by_gid:
+            device = self.hidden_states.device
+            self._slot_mapping_buffer_by_gid[gid] = torch.zeros(
+                self.max_num_tokens, dtype=torch.int64, device=device
+            )
+        return self._slot_mapping_buffer_by_gid[gid]
+
+    def _get_slot_mapping_for_inference(
+        self,
+        num_tokens: int,
+        layer_to_kv_cache_gid: dict[str, int],
+        draft_kv_cache_group_ids: list[int],
+        slot_mapping_by_gid: dict[int, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        """Return slot_mapping dict for EAGLE/draft layers during inference.
+
+        Copies per-group slot mappings from CommonAttentionMetadata into
+        per-gid buffers and returns views into those buffers.
+        """
+        first_gid = draft_kv_cache_group_ids[0]
+        for gid in draft_kv_cache_group_ids:
+            buf = self._ensure_slot_mapping_buffer(gid)
+            src = slot_mapping_by_gid[gid]
+            n = min(num_tokens, src.shape[0])
+            buf[:n].copy_(src[:n])
+            if n < num_tokens:
+                buf[n:num_tokens].fill_(PADDING_SLOT_ID)
+        result: dict[str, torch.Tensor] = {}
+        for layer_name in self.attn_layer_names:
+            gid = layer_to_kv_cache_gid.get(layer_name, first_gid)
+            result[layer_name] = self._slot_mapping_buffer_by_gid[gid][:num_tokens]
+        for layer_name in self.indexer_layer_names:
+            result[layer_name] = self._slot_mapping_buffer_by_gid[first_gid][
+                :num_tokens
+            ]
+        return result
+
+    def _get_slot_mapping_for_dummy_run(
         self,
         num_tokens: int,
         slot_mapping: torch.Tensor | None = None,
-        layer_to_kv_cache_gid: dict[str, int] | None = None,
-        draft_kv_cache_group_ids: list[int] | None = None,
     ) -> dict[str, torch.Tensor]:
-        """Return slot_mapping dict for EAGLE/draft layers.
+        """Return slot_mapping dict for EAGLE/draft layers during dummy run.
 
-        When layer_to_kv_cache_gid and draft_kv_cache_group_ids are provided
-        (from CommonAttentionMetadata), uses per-group slot mappings. Otherwise
-        falls back to the passed slot_mapping and shared buffer (e.g. cudagraph).
+        No CommonAttentionMetadata; uses per-gid buffer (gid 0) and optional
+        slot_mapping.
         """
-        if (
-            self._multi_group_slot_mappings
-            and layer_to_kv_cache_gid is not None
-            and draft_kv_cache_group_ids
-        ):
-            first_gid = draft_kv_cache_group_ids[0]
-            result: dict[str, torch.Tensor] = {}
-            for layer_name in self.attn_layer_names:
-                gid = layer_to_kv_cache_gid.get(layer_name, first_gid)
-                sm = self._multi_group_slot_mappings.get(gid)
-                if sm is None:
-                    sm = self._multi_group_slot_mappings[first_gid]
-                result[layer_name] = sm
-            for layer_name in self.indexer_layer_names:
-                result[layer_name] = self._multi_group_slot_mappings[first_gid]
-            return result
-
-        # Fallback when metadata not provided (e.g. cudagraph capture)
+        buf = self._ensure_slot_mapping_buffer(0)
         if slot_mapping is not None:
             num_actual = slot_mapping.shape[0]
-            self._slot_mapping_buffer[:num_actual].copy_(slot_mapping)
+            buf[:num_actual].copy_(slot_mapping)
             if num_tokens > num_actual:
-                self._slot_mapping_buffer[num_actual:num_tokens].fill_(PADDING_SLOT_ID)
-
-        view = self._slot_mapping_buffer[:num_tokens]
+                buf[num_actual:num_tokens].fill_(PADDING_SLOT_ID)
+        view = buf[:num_tokens]
         return {name: view for name in self.attn_layer_names + self.indexer_layer_names}
 
     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
@@ -377,9 +393,7 @@ class SpecDecodeBaseProposer:
 
         for kv_cache_gid in draft_kv_cache_group_ids:
             blk_table_tensor = block_tables_by_gid[kv_cache_gid]
-
-            # First pass: use extended slot mappings from set_inputs_first_pass.
-            slot_mapping = self._multi_group_slot_mappings[kv_cache_gid]
+            slot_mapping = common_attn_metadata.slot_mapping_by_gid[kv_cache_gid]
 
             cm = replace(
                 common_attn_metadata,
@@ -457,11 +471,11 @@ class SpecDecodeBaseProposer:
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
-            slot_mapping=self._get_slot_mapping(
-                num_input_tokens,
-                common_attn_metadata.slot_mapping,
-                layer_to_kv_cache_gid,
-                draft_kv_cache_group_ids,
+            slot_mapping=self._get_slot_mapping_for_inference(
+                num_tokens=num_input_tokens,
+                layer_to_kv_cache_gid=layer_to_kv_cache_gid,
+                draft_kv_cache_group_ids=draft_kv_cache_group_ids,
+                slot_mapping_by_gid=common_attn_metadata.slot_mapping_by_gid,
             ),
         ):
             ret_hidden_states = self.model(**model_kwargs)
@@ -599,6 +613,7 @@ class SpecDecodeBaseProposer:
                 common_attn_metadata._num_computed_tokens_cpu += 1
 
             # Compute per-group slot mappings and rebuild attention metadata.
+            new_slot_mapping_by_gid: dict[int, torch.Tensor] = {}
             for gid_idx, kv_cache_gid in enumerate(draft_kv_cache_group_ids):
                 blk_table_tensor = self._block_tables_by_gid[kv_cache_gid]
 
@@ -624,14 +639,10 @@ class SpecDecodeBaseProposer:
                         + clamped_positions % group_block_size
                     )
                 slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
+                new_slot_mapping_by_gid[kv_cache_gid] = slot_mapping
 
-                # Store for use by _get_slot_mapping()
-                self._multi_group_slot_mappings[kv_cache_gid] = slot_mapping
-
-                # Update common_attn_metadata for first group (for consistency)
                 if gid_idx == 0:
-                    common_attn_metadata.slot_mapping = slot_mapping
-                    cm = common_attn_metadata
+                    cm = replace(common_attn_metadata, slot_mapping=slot_mapping)
                 else:
                     cm = replace(
                         common_attn_metadata,
@@ -647,6 +658,11 @@ class SpecDecodeBaseProposer:
                 for layer_name in self.attn_layer_names:
                     if layer_to_kv_cache_gid.get(layer_name) == kv_cache_gid:
                         per_layer_attn_metadata[layer_name] = attn_metadata
+
+            common_attn_metadata = common_attn_metadata.replace(
+                slot_mapping_by_gid=new_slot_mapping_by_gid,
+                slot_mapping=new_slot_mapping_by_gid[draft_kv_cache_group_ids[0]],
+            )
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
@@ -676,11 +692,11 @@ class SpecDecodeBaseProposer:
                 num_tokens=input_batch_size,
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
-                slot_mapping=self._get_slot_mapping(
-                    input_batch_size,
-                    common_attn_metadata.slot_mapping,
-                    layer_to_kv_cache_gid,
-                    draft_kv_cache_group_ids,
+                slot_mapping=self._get_slot_mapping_for_inference(
+                    num_tokens=input_batch_size,
+                    layer_to_kv_cache_gid=layer_to_kv_cache_gid,
+                    draft_kv_cache_group_ids=draft_kv_cache_group_ids,
+                    slot_mapping_by_gid=common_attn_metadata.slot_mapping_by_gid,
                 ),
             ):
                 ret_hidden_states = self.model(**model_kwargs)
@@ -909,15 +925,14 @@ class SpecDecodeBaseProposer:
         assert isinstance(tree_attn_metadata_builder, TreeAttentionMetadataBuilder)
 
         layer_to_kv_cache_gid = common_attn_metadata.layer_to_kv_cache_gid
-        draft_kv_cache_group_ids = None
-        if isinstance(layer_to_kv_cache_gid, dict):
-            draft_kv_cache_group_ids = sorted(
-                set(
-                    gid
-                    for layer_name, gid in layer_to_kv_cache_gid.items()
-                    if layer_name in self.attn_layer_names
-                )
+        assert isinstance(layer_to_kv_cache_gid, dict)
+        draft_kv_cache_group_ids = sorted(
+            set(
+                gid
+                for layer_name, gid in layer_to_kv_cache_gid.items()
+                if layer_name in self.attn_layer_names
             )
+        )
 
         total_num_drafts = self.cu_drafts_per_level[0]
         level_num_drafts = total_num_drafts
@@ -1006,12 +1021,7 @@ class SpecDecodeBaseProposer:
             attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
 
             # Compute the slot mapping (tree uses first KV cache group, gid 0).
-            block_size_by_gid = common_attn_metadata.block_size_by_gid
-            block_size = (
-                block_size_by_gid[0]
-                if isinstance(block_size_by_gid, dict)
-                else tree_attn_metadata_builder.kv_cache_spec.block_size
-            )
+            block_size = common_attn_metadata.block_size_by_gid[0]
             query_positions = flattened_draft_positions[:, level : level + query_len]
             block_numbers = query_positions // block_size
             block_ids = attn_metadata.block_table.gather(dim=1, index=block_numbers)
@@ -1039,11 +1049,11 @@ class SpecDecodeBaseProposer:
                 self.vllm_config,
                 num_tokens=num_input_tokens,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
-                slot_mapping=self._get_slot_mapping(
-                    num_input_tokens,
-                    attn_metadata.slot_mapping,
-                    layer_to_kv_cache_gid,
-                    draft_kv_cache_group_ids,
+                slot_mapping=self._get_slot_mapping_for_inference(
+                    num_tokens=num_input_tokens,
+                    layer_to_kv_cache_gid=layer_to_kv_cache_gid,
+                    draft_kv_cache_group_ids=draft_kv_cache_group_ids,
+                    slot_mapping_by_gid=common_attn_metadata.slot_mapping_by_gid,
                 ),
             ):
                 last_hidden_states, hidden_states = self.model(
@@ -1415,7 +1425,9 @@ class SpecDecodeBaseProposer:
                 and slot_mappings is not None
                 and self.attn_layer_names[0] in slot_mappings
             ):
-                slot_mapping_dict = self._get_slot_mapping(num_input_tokens)
+                slot_mapping_dict = self._get_slot_mapping_for_dummy_run(
+                    num_tokens=num_input_tokens
+                )
             else:
                 slot_mapping_dict = slot_mappings or {}
 

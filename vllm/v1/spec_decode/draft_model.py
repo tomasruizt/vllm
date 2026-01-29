@@ -124,8 +124,6 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         )
 
         # Compute slot mappings for all draft KV cache groups
-        # Use target model's block tables when available (from cad.block_tables_by_gid)
-        self._multi_group_slot_mappings: dict[int, torch.Tensor] = {}
         block_tables_by_gid = cad.block_tables_by_gid
         assert isinstance(block_tables_by_gid, dict)
         assert isinstance(cad.slot_mapping_by_gid, dict)
@@ -140,6 +138,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
                 if layer_name in self.attn_layer_names
             )
         )
+        new_slot_mapping_by_gid: dict[int, torch.Tensor] = {}
         for kv_cache_gid in draft_kv_cache_group_ids:
             blk_table_tensor = block_tables_by_gid[kv_cache_gid]
             block_size = block_size_by_gid[kv_cache_gid]
@@ -151,18 +150,15 @@ class DraftModelProposer(SpecDecodeBaseProposer):
                 max_model_len=self.max_model_len,
                 block_table_tensor=blk_table_tensor,
             )
-            self._multi_group_slot_mappings[kv_cache_gid] = slot_mapping
+            new_slot_mapping_by_gid[kv_cache_gid] = slot_mapping
 
-        # Use first group's slot_mapping for new_cad
         first_gid = draft_kv_cache_group_ids[0]
-        new_slot_mapping = self._multi_group_slot_mappings[first_gid]
-
-        # update common_attn_metadata
         new_cad: CommonAttentionMetadata = extend_all_queries_by_1(
             cad,
             arange=self.arange,
-            new_slot_mapping=new_slot_mapping,
+            new_slot_mapping=new_slot_mapping_by_gid[first_gid],
         )
+        new_cad = new_cad.replace(slot_mapping_by_gid=new_slot_mapping_by_gid)
 
         new_last_token_indices = new_cad.query_start_loc[1:] - 1
         if num_rejected_tokens_gpu is not None:
