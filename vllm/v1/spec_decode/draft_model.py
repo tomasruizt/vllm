@@ -7,7 +7,7 @@ import torch
 from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.speculative import SpeculativeConfig
 from vllm.logger import init_logger
-from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.model_loader import get_model
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.utils import (
@@ -170,7 +170,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         # This must be computed before loading the draft model
         # because that mutates the forward_context of the vllm_config
         target_attn_layer_names = set(
-            get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase).keys()
+            get_layers_from_vllm_config(self.vllm_config, Attention).keys()
         )
 
         from vllm.compilation.backends import set_model_tag
@@ -190,7 +190,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         # This must be computed after loading the draft model
         # because that mutates the forward_context of the vllm_config
         draft_attn_layer_names = (
-            get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase).keys()
+            get_layers_from_vllm_config(self.vllm_config, Attention).keys()
             - target_attn_layer_names
         )
         self.attn_layer_names = list(draft_attn_layer_names)
