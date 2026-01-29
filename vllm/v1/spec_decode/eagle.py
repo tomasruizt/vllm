@@ -391,12 +391,12 @@ class SpecDecodeBaseProposer:
         # Build attention metadata for each KV cache group
         per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
 
+        attn_metadata_by_gid: dict[int, AttentionMetadata] = {}
         for kv_cache_gid in draft_kv_cache_group_ids:
             blk_table_tensor = block_tables_by_gid[kv_cache_gid]
             slot_mapping = common_attn_metadata.slot_mapping_by_gid[kv_cache_gid]
 
-            cm = replace(
-                common_attn_metadata,
+            cm = common_attn_metadata.replace(
                 block_table_tensor=blk_table_tensor,
                 slot_mapping=slot_mapping,
             )
@@ -405,11 +405,11 @@ class SpecDecodeBaseProposer:
             attn_metadata = builder.build_for_drafting(
                 common_attn_metadata=cm, draft_index=0
             )
+            attn_metadata_by_gid[kv_cache_gid] = attn_metadata
 
-            # Assign attention metadata to layers in this group
-            for layer_name in self.attn_layer_names:
-                if layer_to_kv_cache_gid.get(layer_name) == kv_cache_gid:
-                    per_layer_attn_metadata[layer_name] = attn_metadata
+        for layer_name in self.attn_layer_names:
+            gid = layer_to_kv_cache_gid[layer_name]
+            per_layer_attn_metadata[layer_name] = attn_metadata_by_gid[gid]
 
         # FIXME: support hybrid kv for draft model (remove separate indexer)
         if self.draft_indexer_metadata_builder:
@@ -614,7 +614,8 @@ class SpecDecodeBaseProposer:
 
             # Compute per-group slot mappings and rebuild attention metadata.
             new_slot_mapping_by_gid: dict[int, torch.Tensor] = {}
-            for gid_idx, kv_cache_gid in enumerate(draft_kv_cache_group_ids):
+            attn_metadata_by_gid = {}
+            for kv_cache_gid in draft_kv_cache_group_ids:
                 blk_table_tensor = self._block_tables_by_gid[kv_cache_gid]
 
                 # Compute per-group block_size and block_numbers
@@ -641,28 +642,25 @@ class SpecDecodeBaseProposer:
                 slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
                 new_slot_mapping_by_gid[kv_cache_gid] = slot_mapping
 
-                if gid_idx == 0:
-                    cm = replace(common_attn_metadata, slot_mapping=slot_mapping)
-                else:
-                    cm = replace(
-                        common_attn_metadata,
-                        block_table_tensor=blk_table_tensor,
-                        slot_mapping=slot_mapping,
-                    )
+                cm = common_attn_metadata.replace(
+                    block_table_tensor=blk_table_tensor,
+                    slot_mapping=slot_mapping,
+                )
 
                 builder = attn_metadata_builders[kv_cache_gid]
                 attn_metadata = builder.build_for_drafting(
                     common_attn_metadata=cm, draft_index=token_index + 1
                 )
-
-                for layer_name in self.attn_layer_names:
-                    if layer_to_kv_cache_gid.get(layer_name) == kv_cache_gid:
-                        per_layer_attn_metadata[layer_name] = attn_metadata
+                attn_metadata_by_gid[kv_cache_gid] = attn_metadata
 
             common_attn_metadata = common_attn_metadata.replace(
                 slot_mapping_by_gid=new_slot_mapping_by_gid,
                 slot_mapping=new_slot_mapping_by_gid[draft_kv_cache_group_ids[0]],
             )
+
+            for layer_name in self.attn_layer_names:
+                gid = layer_to_kv_cache_gid[layer_name]
+                per_layer_attn_metadata[layer_name] = attn_metadata_by_gid[gid]
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
@@ -886,8 +884,8 @@ class SpecDecodeBaseProposer:
             num_actual_tokens=total_num_tokens,
             max_query_len=new_query_len_per_req.max().item(),
             max_seq_len=common_attn_metadata.seq_lens_cpu.max().item(),
-            block_table_tensor=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
+            block_table_tensor=torch.empty(0),  # block_table_tensor is set in propose()
+            slot_mapping=torch.empty(0),  # slot_mapping is set in propose()
             block_tables_by_gid=common_attn_metadata.block_tables_by_gid,
             slot_mapping_by_gid={
                 gid: t[:total_num_tokens]
@@ -1190,8 +1188,8 @@ class SpecDecodeBaseProposer:
             num_actual_tokens=total_num_tokens,
             max_query_len=new_query_len_per_req.max().item(),
             max_seq_len=new_seq_lens_cpu.max().item(),
-            block_table_tensor=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping[token_indices],
+            block_table_tensor=torch.empty(0),  # block_table_tensor is set in propose()
+            slot_mapping=torch.empty(0),  # slot_mapping is set in propose()
             block_tables_by_gid=common_attn_metadata.block_tables_by_gid,
             slot_mapping_by_gid=slot_mapping_by_gid,
             layer_to_kv_cache_gid=common_attn_metadata.layer_to_kv_cache_gid,

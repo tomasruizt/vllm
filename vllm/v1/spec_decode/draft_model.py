@@ -152,13 +152,11 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             )
             new_slot_mapping_by_gid[kv_cache_gid] = slot_mapping
 
-        first_gid = draft_kv_cache_group_ids[0]
         new_cad: CommonAttentionMetadata = extend_all_queries_by_1(
             cad,
             arange=self.arange,
-            new_slot_mapping=new_slot_mapping_by_gid[first_gid],
+            slot_mapping_by_gid=new_slot_mapping_by_gid,
         )
-        new_cad = new_cad.replace(slot_mapping_by_gid=new_slot_mapping_by_gid)
 
         new_last_token_indices = new_cad.query_start_loc[1:] - 1
         if num_rejected_tokens_gpu is not None:
@@ -227,7 +225,7 @@ def compute_new_slot_mapping(
     is_rejected_token_mask: torch.Tensor,
     block_size: int,
     max_model_len: int,
-    block_table_tensor: torch.Tensor | None = None,
+    block_table_tensor: torch.Tensor,
 ):
     """Compute slot mapping for draft positions.
 
@@ -242,9 +240,6 @@ def compute_new_slot_mapping(
             cad.block_table_tensor. This parameter allows computing
             slot_mapping for different KV cache groups.
     """
-    if block_table_tensor is None:
-        block_table_tensor = cad.block_table_tensor
-
     batch_size, n_blocks_per_req = block_table_tensor.shape
     req_indices = torch.arange(batch_size, device=cad.query_start_loc.device)
     req_indices = torch.repeat_interleave(
