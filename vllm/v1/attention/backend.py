@@ -319,6 +319,8 @@ class CommonAttentionMetadata:
     slot_mapping_by_gid: dict[int, torch.Tensor] | None = None
     # For multi-group KV cache: layer name -> kv_cache_group_id (for drafter).
     layer_to_kv_cache_gid: dict[str, int] | None = None
+    # For multi-group KV cache: block size per group (for drafter slot mapping).
+    block_size_by_gid: dict[int, int] | None = None
 
     causal: bool = True
 
@@ -425,6 +427,7 @@ class CommonAttentionMetadata:
                 else None
             ),
             layer_to_kv_cache_gid=self.layer_to_kv_cache_gid,
+            block_size_by_gid=self.block_size_by_gid,
             causal=self.causal,
             logits_indices_padded=self.logits_indices_padded,
             num_logits_indices=self.num_logits_indices,

@@ -38,10 +38,6 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         self._raise_if_vocab_size_mismatch()
         self._raise_if_draft_tp_mismatch()
 
-    def _block_size(self, kv_cache_gid: int) -> int:
-        builders = self._get_attention_metadata_builders()
-        return builders[kv_cache_gid].kv_cache_spec.block_size
-
     def _raise_if_multimodal(self):
         if self.supports_mm_inputs:
             raise NotImplementedError(
@@ -132,16 +128,26 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         self._multi_group_slot_mappings: dict[int, torch.Tensor] = {}
         block_tables_by_gid = cad.block_tables_by_gid
         assert isinstance(block_tables_by_gid, dict)
-        assert isinstance(cad.slot_mapping_by_gid, dict), "need slot_mapping_by_gid"
-        assert isinstance(cad.layer_to_kv_cache_gid, dict), "need layer_to_kv_cache_gid"
-        for kv_cache_gid in self._draft_kv_cache_group_ids:
+        assert isinstance(cad.slot_mapping_by_gid, dict)
+        layer_to_kv_cache_gid = cad.layer_to_kv_cache_gid
+        assert isinstance(layer_to_kv_cache_gid, dict)
+        block_size_by_gid = cad.block_size_by_gid
+        assert isinstance(block_size_by_gid, dict)
+        draft_kv_cache_group_ids = sorted(
+            set(
+                gid
+                for layer_name, gid in layer_to_kv_cache_gid.items()
+                if layer_name in self.attn_layer_names
+            )
+        )
+        for kv_cache_gid in draft_kv_cache_group_ids:
             # Prefer target model's block tables from CommonAttentionMetadata
             if block_tables_by_gid is not None and kv_cache_gid in block_tables_by_gid:
                 blk_table_tensor = block_tables_by_gid[kv_cache_gid]
             else:
                 blk_table = self.runner.input_batch.block_table[kv_cache_gid]
                 blk_table_tensor = blk_table.get_device_tensor(batch_size)
-            block_size = self._block_size(kv_cache_gid)
+            block_size = block_size_by_gid[kv_cache_gid]
             slot_mapping = compute_new_slot_mapping(
                 cad=cad,
                 new_positions=self.positions[:num_tokens],
@@ -153,7 +159,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             self._multi_group_slot_mappings[kv_cache_gid] = slot_mapping
 
         # Use first group's slot_mapping for new_cad
-        first_gid = self._draft_kv_cache_group_ids[0]
+        first_gid = draft_kv_cache_group_ids[0]
         new_slot_mapping = self._multi_group_slot_mappings[first_gid]
 
         # update common_attn_metadata
@@ -199,8 +205,8 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             - target_attn_layer_names
         )
         self.attn_layer_names = list(draft_attn_layer_names)
-        # Note: _init_kv_cache_group_mapping() is called lazily in propose()
-        # after initialize_kv_cache() populates self.runner.attn_groups
+        # layer_to_kv_cache_gid and draft_kv_cache_group_ids come from
+        # CommonAttentionMetadata in set_inputs_first_pass() / propose()
 
 
 def create_vllm_config_for_draft_model(

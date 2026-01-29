@@ -171,10 +171,8 @@ class SpecDecodeBaseProposer:
             self.max_num_tokens, dtype=torch.int64, device=device
         )
 
-        # Multi-KV-cache-group support: initialized in _init_kv_cache_group_mapping()
-        # after load_model() populates attn_layer_names
-        self._layer_to_kv_cache_group: dict[str, int] = {}
-        self._draft_kv_cache_group_ids: list[int] = []
+        # Multi-KV-cache-group: layer_to_kv_cache_gid / draft_kv_cache_group_ids
+        # from CommonAttentionMetadata in propose()
         self._attn_metadata_builders: dict[int, AttentionMetadataBuilder] = {}
         self._multi_group_slot_mappings: dict[int, torch.Tensor] = {}
         self._block_tables_by_gid: dict[int, torch.Tensor] | None = None
@@ -258,19 +256,24 @@ class SpecDecodeBaseProposer:
         self,
         num_tokens: int,
         slot_mapping: torch.Tensor | None = None,
+        layer_to_kv_cache_gid: dict[str, int] | None = None,
+        draft_kv_cache_group_ids: list[int] | None = None,
     ) -> dict[str, torch.Tensor]:
         """Return slot_mapping dict for EAGLE/draft layers.
 
-        Always uses per-group slot mappings: single-group is the special case
-        with one entry in _multi_group_slot_mappings. When the dict is not yet
-        populated (e.g. during cudagraph capture), falls back to the passed
-        slot_mapping and shared buffer.
+        When layer_to_kv_cache_gid and draft_kv_cache_group_ids are provided
+        (from CommonAttentionMetadata), uses per-group slot mappings. Otherwise
+        falls back to the passed slot_mapping and shared buffer (e.g. cudagraph).
         """
-        if self._multi_group_slot_mappings and self._draft_kv_cache_group_ids:
-            first_gid = self._draft_kv_cache_group_ids[0]
+        if (
+            self._multi_group_slot_mappings
+            and layer_to_kv_cache_gid is not None
+            and draft_kv_cache_group_ids
+        ):
+            first_gid = draft_kv_cache_group_ids[0]
             result: dict[str, torch.Tensor] = {}
             for layer_name in self.attn_layer_names:
-                gid = self._layer_to_kv_cache_group.get(layer_name, first_gid)
+                gid = layer_to_kv_cache_gid.get(layer_name, first_gid)
                 sm = self._multi_group_slot_mappings.get(gid)
                 if sm is None:
                     sm = self._multi_group_slot_mappings[first_gid]
@@ -279,7 +282,7 @@ class SpecDecodeBaseProposer:
                 result[layer_name] = self._multi_group_slot_mappings[first_gid]
             return result
 
-        # Fallback when dict not yet populated (e.g. cudagraph capture)
+        # Fallback when metadata not provided (e.g. cudagraph capture)
         if slot_mapping is not None:
             num_actual = slot_mapping.shape[0]
             self._slot_mapping_buffer[:num_actual].copy_(slot_mapping)
@@ -288,26 +291,6 @@ class SpecDecodeBaseProposer:
 
         view = self._slot_mapping_buffer[:num_tokens]
         return {name: view for name in self.attn_layer_names + self.indexer_layer_names}
-
-    def _init_kv_cache_group_mapping(self) -> None:
-        """Build mapping from draft layers to KV cache groups.
-
-        Must be called after load_model() populates self.attn_layer_names.
-        Uses self.runner.attn_groups which has structure: list[list[AttentionGroup]]
-        where first index is kv_cache_group_id.
-        """
-        self._layer_to_kv_cache_group = {}
-        self._draft_kv_cache_group_ids = []
-
-        for kv_cache_gid, attn_groups in enumerate(self.runner.attn_groups):
-            has_draft_layer = False
-            for attn_group in attn_groups:
-                for layer_name in attn_group.layer_names:
-                    self._layer_to_kv_cache_group[layer_name] = kv_cache_gid
-                    if layer_name in self.attn_layer_names:
-                        has_draft_layer = True
-            if has_draft_layer:
-                self._draft_kv_cache_group_ids.append(kv_cache_gid)
 
     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
         """Initialize cudagraph dispatcher keys for eagle.
@@ -356,23 +339,22 @@ class SpecDecodeBaseProposer:
 
         assert self.runner is not None
 
-        # Block tables and slot mappings per group (from CommonAttentionMetadata)
+        # Per-group block tables, block sizes, slot mappings (from common_attn_metadata)
         block_tables_by_gid = common_attn_metadata.block_tables_by_gid
         assert isinstance(block_tables_by_gid, dict)
         self._block_tables_by_gid = block_tables_by_gid
         assert isinstance(common_attn_metadata.slot_mapping_by_gid, dict)
         layer_to_kv_cache_gid = common_attn_metadata.layer_to_kv_cache_gid
-        assert isinstance(layer_to_kv_cache_gid, dict), "need layer_to_kv_cache_gid"
-        self._layer_to_kv_cache_group = layer_to_kv_cache_gid
-        self._draft_kv_cache_group_ids = sorted(
+        assert isinstance(layer_to_kv_cache_gid, dict)
+        block_size_by_gid = common_attn_metadata.block_size_by_gid
+        assert isinstance(block_size_by_gid, dict)
+        draft_kv_cache_group_ids = sorted(
             set(
                 gid
                 for layer_name, gid in layer_to_kv_cache_gid.items()
                 if layer_name in self.attn_layer_names
             )
         )
-        if not self._draft_kv_cache_group_ids:
-            self._init_kv_cache_group_mapping()
 
         num_tokens, last_token_indices, common_attn_metadata = (
             self.set_inputs_first_pass(
@@ -386,12 +368,14 @@ class SpecDecodeBaseProposer:
         )
 
         # Get attention metadata builders for all KV cache groups with draft layers
-        attn_metadata_builders = self._get_attention_metadata_builders()
+        attn_metadata_builders = self._get_attention_metadata_builders(
+            draft_kv_cache_group_ids
+        )
 
         # Build attention metadata for each KV cache group
         per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
 
-        for kv_cache_gid in self._draft_kv_cache_group_ids:
+        for kv_cache_gid in draft_kv_cache_group_ids:
             num_reqs = common_attn_metadata.num_reqs
 
             # Get block table for this group - prefer passed block tables from
@@ -418,7 +402,7 @@ class SpecDecodeBaseProposer:
 
             # Assign attention metadata to layers in this group
             for layer_name in self.attn_layer_names:
-                if self._layer_to_kv_cache_group.get(layer_name) == kv_cache_gid:
+                if layer_to_kv_cache_gid.get(layer_name) == kv_cache_gid:
                     per_layer_attn_metadata[layer_name] = attn_metadata
 
         # FIXME: support hybrid kv for draft model (remove separate indexer)
@@ -482,15 +466,18 @@ class SpecDecodeBaseProposer:
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             slot_mapping=self._get_slot_mapping(
-                num_input_tokens, common_attn_metadata.slot_mapping
+                num_input_tokens,
+                common_attn_metadata.slot_mapping,
+                layer_to_kv_cache_gid,
+                draft_kv_cache_group_ids,
             ),
         ):
             ret_hidden_states = self.model(**model_kwargs)
-            if not self.model_returns_tuple():
-                last_hidden_states = ret_hidden_states
-                hidden_states = last_hidden_states
-            else:
-                last_hidden_states, hidden_states = ret_hidden_states
+        if not self.model_returns_tuple():
+            last_hidden_states = ret_hidden_states
+            hidden_states = last_hidden_states
+        else:
+            last_hidden_states, hidden_states = ret_hidden_states
 
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states)
@@ -620,8 +607,7 @@ class SpecDecodeBaseProposer:
                 common_attn_metadata._num_computed_tokens_cpu += 1
 
             # Compute per-group slot mappings and rebuild attention metadata.
-            # Single group = one entry in _draft_kv_cache_group_ids.
-            for gid_idx, kv_cache_gid in enumerate(self._draft_kv_cache_group_ids):
+            for gid_idx, kv_cache_gid in enumerate(draft_kv_cache_group_ids):
                 # Use target model's block tables when available
                 if (
                     self._block_tables_by_gid is not None
@@ -637,8 +623,7 @@ class SpecDecodeBaseProposer:
                     )
 
                 # Compute per-group block_size and block_numbers
-                builder = attn_metadata_builders[kv_cache_gid]
-                group_block_size = builder.kv_cache_spec.block_size
+                group_block_size = block_size_by_gid[kv_cache_gid]
                 if self.uses_mrope:
                     group_block_numbers = clamped_positions[0] // group_block_size
                 else:
@@ -680,7 +665,7 @@ class SpecDecodeBaseProposer:
                 )
 
                 for layer_name in self.attn_layer_names:
-                    if self._layer_to_kv_cache_group.get(layer_name) == kv_cache_gid:
+                    if layer_to_kv_cache_gid.get(layer_name) == kv_cache_gid:
                         per_layer_attn_metadata[layer_name] = attn_metadata
 
             # copy inputs to buffer for cudagraph
@@ -712,7 +697,10 @@ class SpecDecodeBaseProposer:
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(
-                    input_batch_size, common_attn_metadata.slot_mapping
+                    input_batch_size,
+                    common_attn_metadata.slot_mapping,
+                    layer_to_kv_cache_gid,
+                    draft_kv_cache_group_ids,
                 ),
             ):
                 ret_hidden_states = self.model(**model_kwargs)
@@ -910,6 +898,7 @@ class SpecDecodeBaseProposer:
                 for gid, t in common_attn_metadata.slot_mapping_by_gid.items()
             },
             layer_to_kv_cache_gid=common_attn_metadata.layer_to_kv_cache_gid,
+            block_size_by_gid=common_attn_metadata.block_size_by_gid,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
@@ -938,6 +927,17 @@ class SpecDecodeBaseProposer:
             0
         ].get_metadata_builder()
         assert isinstance(tree_attn_metadata_builder, TreeAttentionMetadataBuilder)
+
+        layer_to_kv_cache_gid = common_attn_metadata.layer_to_kv_cache_gid
+        draft_kv_cache_group_ids = None
+        if isinstance(layer_to_kv_cache_gid, dict):
+            draft_kv_cache_group_ids = sorted(
+                set(
+                    gid
+                    for layer_name, gid in layer_to_kv_cache_gid.items()
+                    if layer_name in self.attn_layer_names
+                )
+            )
 
         total_num_drafts = self.cu_drafts_per_level[0]
         level_num_drafts = total_num_drafts
@@ -1025,8 +1025,13 @@ class SpecDecodeBaseProposer:
             # sequence length to 1 to minimize their overheads in attention.
             attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
 
-            # Compute the slot mapping.
-            block_size = tree_attn_metadata_builder.kv_cache_spec.block_size
+            # Compute the slot mapping (tree uses first KV cache group, gid 0).
+            block_size_by_gid = common_attn_metadata.block_size_by_gid
+            block_size = (
+                block_size_by_gid[0]
+                if isinstance(block_size_by_gid, dict)
+                else tree_attn_metadata_builder.kv_cache_spec.block_size
+            )
             query_positions = flattened_draft_positions[:, level : level + query_len]
             block_numbers = query_positions // block_size
             block_ids = attn_metadata.block_table.gather(dim=1, index=block_numbers)
@@ -1055,7 +1060,10 @@ class SpecDecodeBaseProposer:
                 num_tokens=num_input_tokens,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping(
-                    num_input_tokens, attn_metadata.slot_mapping
+                    num_input_tokens,
+                    attn_metadata.slot_mapping,
+                    layer_to_kv_cache_gid,
+                    draft_kv_cache_group_ids,
                 ),
             ):
                 last_hidden_states, hidden_states = self.model(
@@ -1197,6 +1205,7 @@ class SpecDecodeBaseProposer:
             block_tables_by_gid=common_attn_metadata.block_tables_by_gid,
             slot_mapping_by_gid=slot_mapping_by_gid,
             layer_to_kv_cache_gid=common_attn_metadata.layer_to_kv_cache_gid,
+            block_size_by_gid=common_attn_metadata.block_size_by_gid,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
@@ -1392,9 +1401,6 @@ class SpecDecodeBaseProposer:
                 del self.model.lm_head
             self.model.lm_head = target_language_model.lm_head
 
-        # Initialize KV cache group mapping now that attn_layer_names is populated
-        self._init_kv_cache_group_mapping()
-
     @torch.inference_mode()
     def dummy_run(
         self,
@@ -1457,15 +1463,11 @@ class SpecDecodeBaseProposer:
                     kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
                 self.model(**kwargs)
 
-    def _get_attention_metadata_builders(self) -> dict[int, AttentionMetadataBuilder]:
+    def _get_attention_metadata_builders(
+        self, draft_kv_cache_group_ids: list[int]
+    ) -> dict[int, AttentionMetadataBuilder]:
         """Find and return attention metadata builders for each KV cache group
         that contains draft layers.
-
-        Returns:
-            Dict mapping kv_cache_group_id to AttentionMetadataBuilder.
-
-        Raises:
-            AssertionError: If no builders found for any draft KV cache group.
         """
         if self._attn_metadata_builders:
             return self._attn_metadata_builders
@@ -1473,7 +1475,7 @@ class SpecDecodeBaseProposer:
         draft_layer_set = set(self.attn_layer_names)
         builders: dict[int, AttentionMetadataBuilder] = {}
 
-        for kv_cache_gid in self._draft_kv_cache_group_ids:
+        for kv_cache_gid in draft_kv_cache_group_ids:
             for attn_group in self.runner.attn_groups[kv_cache_gid]:
                 # Find any draft layer in this attn_group
                 for layer_name in attn_group.layer_names:
@@ -1483,10 +1485,9 @@ class SpecDecodeBaseProposer:
                 if kv_cache_gid in builders:
                     break
 
-        assert len(builders) == len(self._draft_kv_cache_group_ids), (
+        assert len(builders) == len(draft_kv_cache_group_ids), (
             f"Failed to find attention metadata builders for all draft KV cache "
-            f"groups. Found {len(builders)}, expected "
-            f"{len(self._draft_kv_cache_group_ids)}"
+            f"groups. Found {len(builders)}, expected {len(draft_kv_cache_group_ids)}"
         )
 
         self._attn_metadata_builders = builders

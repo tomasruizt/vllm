@@ -1814,12 +1814,17 @@ class GPUModelRunner(
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
-        # Build block tables and layer->gid mapping for multi-group spec decode
+        # Block tables, block sizes, layer->gid for multi-group spec decode
         block_tables_by_gid: dict[int, torch.Tensor] | None = None
+        block_size_by_gid: dict[int, int] | None = None
         layer_to_kv_cache_gid: dict[str, int] | None = None
         if self.speculative_config:
             block_tables_by_gid = {
                 gid: _get_block_table(gid) for gid in range(len(kv_cache_groups))
+            }
+            block_size_by_gid = {
+                gid: kv_cache_groups[gid].kv_cache_spec.block_size
+                for gid in range(len(kv_cache_groups))
             }
             layer_to_kv_cache_gid = {}
             for gid in range(len(self.attn_groups)):
@@ -1861,6 +1866,13 @@ class GPUModelRunner(
                 ):
                     spec_decode_common_attn_metadata.layer_to_kv_cache_gid = (
                         layer_to_kv_cache_gid
+                    )
+                if (
+                    spec_decode_common_attn_metadata is not None
+                    and block_size_by_gid is not None
+                ):
+                    spec_decode_common_attn_metadata.block_size_by_gid = (
+                        block_size_by_gid
                     )
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
