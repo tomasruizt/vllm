@@ -132,7 +132,8 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         self._multi_group_slot_mappings: dict[int, torch.Tensor] = {}
         block_tables_by_gid = cad.block_tables_by_gid
         assert isinstance(block_tables_by_gid, dict)
-
+        assert isinstance(cad.slot_mapping_by_gid, dict), "need slot_mapping_by_gid"
+        assert isinstance(cad.layer_to_kv_cache_gid, dict), "need layer_to_kv_cache_gid"
         for kv_cache_gid in self._draft_kv_cache_group_ids:
             # Prefer target model's block tables from CommonAttentionMetadata
             if block_tables_by_gid is not None and kv_cache_gid in block_tables_by_gid:

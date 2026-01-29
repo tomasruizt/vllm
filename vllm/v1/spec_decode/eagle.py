@@ -356,14 +356,21 @@ class SpecDecodeBaseProposer:
 
         assert self.runner is not None
 
-        # Block tables per KV cache group (from CommonAttentionMetadata)
+        # Block tables and slot mappings per group (from CommonAttentionMetadata)
         block_tables_by_gid = common_attn_metadata.block_tables_by_gid
         assert isinstance(block_tables_by_gid, dict)
         self._block_tables_by_gid = block_tables_by_gid
-
-        # Lazy initialization of KV cache group mapping
-        # Must be done after initialize_kv_cache() populates self.runner.attn_groups
-        # and BEFORE set_inputs_first_pass() which needs _draft_kv_cache_group_ids
+        assert isinstance(common_attn_metadata.slot_mapping_by_gid, dict)
+        layer_to_kv_cache_gid = common_attn_metadata.layer_to_kv_cache_gid
+        assert isinstance(layer_to_kv_cache_gid, dict), "need layer_to_kv_cache_gid"
+        self._layer_to_kv_cache_group = layer_to_kv_cache_gid
+        self._draft_kv_cache_group_ids = sorted(
+            set(
+                gid
+                for layer_name, gid in layer_to_kv_cache_gid.items()
+                if layer_name in self.attn_layer_names
+            )
+        )
         if not self._draft_kv_cache_group_ids:
             self._init_kv_cache_group_mapping()
 
@@ -395,11 +402,8 @@ class SpecDecodeBaseProposer:
                 blk_table = self.runner.input_batch.block_table[kv_cache_gid]
                 blk_table_tensor = blk_table.get_device_tensor(num_reqs)
 
-            # Use stored per-group slot mapping or target's slot_mapping (first pass)
-            slot_mapping = self._multi_group_slot_mappings.get(
-                kv_cache_gid, common_attn_metadata.slot_mapping
-            )
-            self._multi_group_slot_mappings[kv_cache_gid] = slot_mapping
+            # First pass: use extended slot mappings from set_inputs_first_pass.
+            slot_mapping = self._multi_group_slot_mappings[kv_cache_gid]
 
             cm = replace(
                 common_attn_metadata,
@@ -887,6 +891,7 @@ class SpecDecodeBaseProposer:
 
         total_num_tokens = query_start_loc_cpu[-1].item()
 
+        assert isinstance(common_attn_metadata.slot_mapping_by_gid, dict)
         spec_common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=common_attn_metadata.query_start_loc,
             seq_lens=common_attn_metadata.seq_lens,
@@ -900,6 +905,11 @@ class SpecDecodeBaseProposer:
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[:total_num_tokens],
             block_tables_by_gid=common_attn_metadata.block_tables_by_gid,
+            slot_mapping_by_gid={
+                gid: t[:total_num_tokens]
+                for gid, t in common_attn_metadata.slot_mapping_by_gid.items()
+            },
+            layer_to_kv_cache_gid=common_attn_metadata.layer_to_kv_cache_gid,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
@@ -1167,6 +1177,11 @@ class SpecDecodeBaseProposer:
         token_indices_np = token_offests + old_query_start_locs_expanded
         token_indices = torch.from_numpy(token_indices_np).to(device, non_blocking=True)
 
+        slot_mapping_by_gid_raw = common_attn_metadata.slot_mapping_by_gid
+        assert isinstance(slot_mapping_by_gid_raw, dict)
+        slot_mapping_by_gid = {
+            gid: t[token_indices] for gid, t in slot_mapping_by_gid_raw.items()
+        }
         spec_common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=new_query_start_loc_cpu.to(device, non_blocking=True),
             seq_lens=new_seq_lens_cpu.to(device, non_blocking=True),
@@ -1180,6 +1195,8 @@ class SpecDecodeBaseProposer:
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping[token_indices],
             block_tables_by_gid=common_attn_metadata.block_tables_by_gid,
+            slot_mapping_by_gid=slot_mapping_by_gid,
+            layer_to_kv_cache_gid=common_attn_metadata.layer_to_kv_cache_gid,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )

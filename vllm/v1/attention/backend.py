@@ -315,6 +315,10 @@ class CommonAttentionMetadata:
     # For multi-group KV cache (e.g. speculative decoding): block tables per group.
     # When set, drafter uses these instead of a single block_table_tensor.
     block_tables_by_gid: dict[int, torch.Tensor] | None = None
+    # For multi-group KV cache: slot mapping per group (like block_tables_by_gid).
+    slot_mapping_by_gid: dict[int, torch.Tensor] | None = None
+    # For multi-group KV cache: layer name -> kv_cache_group_id (for drafter).
+    layer_to_kv_cache_gid: dict[str, int] | None = None
 
     causal: bool = True
 
@@ -412,6 +416,15 @@ class CommonAttentionMetadata:
                 if self.block_tables_by_gid is not None
                 else None
             ),
+            slot_mapping_by_gid=(
+                {
+                    gid: t[:num_actual_tokens]
+                    for gid, t in self.slot_mapping_by_gid.items()
+                }
+                if self.slot_mapping_by_gid is not None
+                else None
+            ),
+            layer_to_kv_cache_gid=self.layer_to_kv_cache_gid,
             causal=self.causal,
             logits_indices_padded=self.logits_indices_padded,
             num_logits_indices=self.num_logits_indices,
