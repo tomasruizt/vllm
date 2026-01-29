@@ -1858,36 +1858,14 @@ class GPUModelRunner(
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
-                if spec_decode_common_attn_metadata is not None and block_tables_by_gid:
-                    spec_decode_common_attn_metadata.block_tables_by_gid = (
-                        block_tables_by_gid
-                    )
-                if (
-                    spec_decode_common_attn_metadata is not None
-                    and slot_mappings is not None
-                ):
-                    spec_decode_common_attn_metadata.slot_mapping_by_gid = slot_mappings
-                if (
-                    spec_decode_common_attn_metadata is not None
-                    and layer_to_kv_cache_gid is not None
-                ):
-                    spec_decode_common_attn_metadata.layer_to_kv_cache_gid = (
-                        layer_to_kv_cache_gid
-                    )
-                if (
-                    spec_decode_common_attn_metadata is not None
-                    and block_size_by_gid is not None
-                ):
-                    spec_decode_common_attn_metadata.block_size_by_gid = (
-                        block_size_by_gid
-                    )
-                if (
-                    spec_decode_common_attn_metadata is not None
-                    and metadatabuilder_by_gid is not None
-                ):
-                    spec_decode_common_attn_metadata.metadatabuilder_by_gid = (
-                        metadatabuilder_by_gid
-                    )
+
+                sd_cm = spec_decode_common_attn_metadata
+                if sd_cm is not None:
+                    sd_cm.block_tables_by_gid = block_tables_by_gid
+                    sd_cm.slot_mapping_by_gid = slot_mappings
+                    sd_cm.layer_to_kv_cache_gid = layer_to_kv_cache_gid
+                    sd_cm.block_size_by_gid = block_size_by_gid
+                    sd_cm.metadatabuilder_by_gid = metadatabuilder_by_gid
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
