@@ -173,11 +173,6 @@ class SpecDecodeBaseProposer:
             self.new_slot_mapping_buffer
         )
 
-        # Multi-KV-cache-group: layer_to_kv_cache_gid / draft_kv_cache_group_ids
-        # from CommonAttentionMetadata in propose()
-        self._attn_metadata_builders: dict[int, AttentionMetadataBuilder] = {}
-        self._block_tables_by_gid: dict[int, torch.Tensor] | None = None
-
         # Determine allowed attention backends once during initialization.
         self.allowed_attn_types: tuple | None = None
         if current_platform.is_rocm():
@@ -350,14 +345,16 @@ class SpecDecodeBaseProposer:
         assert self.runner is not None
 
         # Per-group block tables, block sizes, slot mappings (from common_attn_metadata)
-        block_tables_by_gid = common_attn_metadata.block_tables_by_gid
-        assert isinstance(block_tables_by_gid, dict)
-        self._block_tables_by_gid = block_tables_by_gid
+        assert isinstance(common_attn_metadata.block_tables_by_gid, dict)
         assert isinstance(common_attn_metadata.slot_mapping_by_gid, dict)
+        assert isinstance(common_attn_metadata.layer_to_kv_cache_gid, dict)
+        assert isinstance(common_attn_metadata.block_size_by_gid, dict)
+        assert isinstance(common_attn_metadata.metadatabuilder_by_gid, dict)
+
+        block_tables_by_gid = common_attn_metadata.block_tables_by_gid
         layer_to_kv_cache_gid = common_attn_metadata.layer_to_kv_cache_gid
-        assert isinstance(layer_to_kv_cache_gid, dict)
         block_size_by_gid = common_attn_metadata.block_size_by_gid
-        assert isinstance(block_size_by_gid, dict)
+        metadatabuilder_by_gid = common_attn_metadata.metadatabuilder_by_gid
         draft_kv_cache_group_ids = sorted(
             set(
                 gid
@@ -377,11 +374,6 @@ class SpecDecodeBaseProposer:
             )
         )
 
-        # Get attention metadata builders for all KV cache groups with draft layers
-        attn_metadata_builders = self._get_attention_metadata_builders(
-            draft_kv_cache_group_ids
-        )
-
         # Build attention metadata for each KV cache group
         per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
 
@@ -395,7 +387,7 @@ class SpecDecodeBaseProposer:
                 slot_mapping=slot_mapping,
             )
 
-            builder = attn_metadata_builders[kv_cache_gid]
+            builder = metadatabuilder_by_gid[kv_cache_gid]
             attn_metadata = builder.build_for_drafting(
                 common_attn_metadata=cm, draft_index=0
             )
@@ -610,7 +602,7 @@ class SpecDecodeBaseProposer:
             new_slot_mapping_by_gid: dict[int, torch.Tensor] = {}
             attn_metadata_by_gid = {}
             for kv_cache_gid in draft_kv_cache_group_ids:
-                blk_table_tensor = self._block_tables_by_gid[kv_cache_gid]
+                blk_table_tensor = block_tables_by_gid[kv_cache_gid]
 
                 # Compute per-group block_size and block_numbers
                 group_block_size = block_size_by_gid[kv_cache_gid]
@@ -641,7 +633,7 @@ class SpecDecodeBaseProposer:
                     slot_mapping=slot_mapping,
                 )
 
-                builder = attn_metadata_builders[kv_cache_gid]
+                builder = metadatabuilder_by_gid[kv_cache_gid]
                 attn_metadata = builder.build_for_drafting(
                     common_attn_metadata=cm, draft_index=token_index + 1
                 )
@@ -887,6 +879,7 @@ class SpecDecodeBaseProposer:
             },
             layer_to_kv_cache_gid=common_attn_metadata.layer_to_kv_cache_gid,
             block_size_by_gid=common_attn_metadata.block_size_by_gid,
+            metadatabuilder_by_gid=common_attn_metadata.metadatabuilder_by_gid,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
@@ -1187,6 +1180,7 @@ class SpecDecodeBaseProposer:
             },
             layer_to_kv_cache_gid=common_attn_metadata.layer_to_kv_cache_gid,
             block_size_by_gid=common_attn_metadata.block_size_by_gid,
+            metadatabuilder_by_gid=common_attn_metadata.metadatabuilder_by_gid,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
@@ -1445,36 +1439,6 @@ class SpecDecodeBaseProposer:
                 if self.pass_hidden_states_to_model:
                     kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
                 self.model(**kwargs)
-
-    def _get_attention_metadata_builders(
-        self, draft_kv_cache_group_ids: list[int]
-    ) -> dict[int, AttentionMetadataBuilder]:
-        """Find and return attention metadata builders for each KV cache group
-        that contains draft layers.
-        """
-        if self._attn_metadata_builders:
-            return self._attn_metadata_builders
-
-        draft_layer_set = set(self.attn_layer_names)
-        builders: dict[int, AttentionMetadataBuilder] = {}
-
-        for kv_cache_gid in draft_kv_cache_group_ids:
-            for attn_group in self.runner.attn_groups[kv_cache_gid]:
-                # Find any draft layer in this attn_group
-                for layer_name in attn_group.layer_names:
-                    if layer_name in draft_layer_set:
-                        builders[kv_cache_gid] = attn_group.get_metadata_builder()
-                        break
-                if kv_cache_gid in builders:
-                    break
-
-        assert len(builders) == len(draft_kv_cache_group_ids), (
-            f"Failed to find attention metadata builders for all draft KV cache "
-            f"groups. Found {len(builders)}, expected {len(draft_kv_cache_group_ids)}"
-        )
-
-        self._attn_metadata_builders = builders
-        return builders
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """

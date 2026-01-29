@@ -321,6 +321,8 @@ class CommonAttentionMetadata:
     layer_to_kv_cache_gid: dict[str, int] | None = None
     # For multi-group KV cache: block size per group (for drafter slot mapping).
     block_size_by_gid: dict[int, int] | None = None
+    # For multi-group KV cache: attention metadata builder per group (for drafter).
+    metadatabuilder_by_gid: dict[int, "AttentionMetadataBuilder"] | None = None
 
     causal: bool = True
 
@@ -428,6 +430,7 @@ class CommonAttentionMetadata:
             ),
             layer_to_kv_cache_gid=self.layer_to_kv_cache_gid,
             block_size_by_gid=self.block_size_by_gid,
+            metadatabuilder_by_gid=self.metadatabuilder_by_gid,
             causal=self.causal,
             logits_indices_padded=self.logits_indices_padded,
             num_logits_indices=self.num_logits_indices,
