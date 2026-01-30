@@ -226,19 +226,6 @@ def compute_new_slot_mapping(
     max_model_len: int,
     block_table_tensor: torch.Tensor,
 ):
-    """Compute slot mapping for draft positions.
-
-    Args:
-        cad: Common attention metadata (used for query_start_loc and
-            block_table_tensor if not provided separately)
-        new_positions: New position ids for tokens
-        is_rejected_token_mask: Mask for rejected tokens
-        block_size: Block size for KV cache
-        max_model_len: Maximum model length
-        block_table_tensor: Optional block table tensor. If None, uses
-            cad.block_table_tensor. This parameter allows computing
-            slot_mapping for different KV cache groups.
-    """
     batch_size, n_blocks_per_req = block_table_tensor.shape
     req_indices = torch.arange(batch_size, device=cad.query_start_loc.device)
     req_indices = torch.repeat_interleave(
