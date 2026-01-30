@@ -184,7 +184,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             draft_vllm_config.parallel_config.tensor_parallel_size,
             draft_vllm_config.parallel_config.rank,
         )
-        with set_model_tag("draft_model"):
+        with set_model_tag(DRAFT_MODEL_PREFIX):
             self.model = get_model(
                 vllm_config=draft_vllm_config, prefix=DRAFT_MODEL_PREFIX
             )
