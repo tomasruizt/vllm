@@ -359,6 +359,7 @@ class SpecDecodeBaseProposer:
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
         )
+        assert common_attn_metadata.kv_cache_info_by_gid is not None
 
         # Build attention metadata for each KV cache group
         per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
@@ -648,6 +649,8 @@ class SpecDecodeBaseProposer:
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = self.hidden_states[:input_batch_size]
 
+            kv_cache_info_by_gid = common_attn_metadata.kv_cache_info_by_gid
+            assert kv_cache_info_by_gid is not None
             with set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
@@ -657,7 +660,7 @@ class SpecDecodeBaseProposer:
                 slot_mapping=self._get_slot_mapping_buffer_for_inference(
                     num_tokens=input_batch_size,
                     layer_to_kv_cache_gid=layer_to_kv_cache_gid,
-                    kv_cache_info_by_gid=common_attn_metadata.kv_cache_info_by_gid,
+                    kv_cache_info_by_gid=kv_cache_info_by_gid,
                 ),
             ):
                 ret_hidden_states = self.model(**model_kwargs)
@@ -881,6 +884,7 @@ class SpecDecodeBaseProposer:
 
         layer_to_kv_cache_gid = common_attn_metadata.layer_to_kv_cache_gid
         assert isinstance(layer_to_kv_cache_gid, dict)
+        assert common_attn_metadata.kv_cache_info_by_gid is not None
 
         total_num_drafts = self.cu_drafts_per_level[0]
         level_num_drafts = total_num_drafts
@@ -991,6 +995,8 @@ class SpecDecodeBaseProposer:
                 num_tokens
             )
             num_input_tokens = batch_desc.num_tokens
+            kv_cache_info_by_gid = common_attn_metadata.kv_cache_info_by_gid
+            assert kv_cache_info_by_gid is not None
             # Run the model.
             with set_forward_context(
                 per_layer_attn_metadata,
@@ -1000,7 +1006,7 @@ class SpecDecodeBaseProposer:
                 slot_mapping=self._get_slot_mapping_buffer_for_inference(
                     num_tokens=num_input_tokens,
                     layer_to_kv_cache_gid=layer_to_kv_cache_gid,
-                    kv_cache_info_by_gid=common_attn_metadata.kv_cache_info_by_gid,
+                    kv_cache_info_by_gid=kv_cache_info_by_gid,
                 ),
             ):
                 last_hidden_states, hidden_states = self.model(
