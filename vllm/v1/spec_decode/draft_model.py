@@ -10,6 +10,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.model_loader import get_model
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backend import KVCacheInfoForSpecDecode
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
     extend_all_queries_by_1,
@@ -124,36 +125,23 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             rejected_tok_fill=0,
         )
 
-        # Compute slot mappings for all draft KV cache groups
-        block_tables_by_gid = cad.block_tables_by_gid
-        assert isinstance(block_tables_by_gid, dict)
-        assert isinstance(cad.slot_mapping_by_gid, dict)
-        layer_to_kv_cache_gid = cad.layer_to_kv_cache_gid
-        assert isinstance(layer_to_kv_cache_gid, dict)
-        block_size_by_gid = cad.block_size_by_gid
-        assert isinstance(block_size_by_gid, dict)
-        draft_kv_cache_group_ids = sorted(
-            set(
-                gid
-                for layer_name, gid in layer_to_kv_cache_gid.items()
-                if layer_name in self.attn_layer_names
-            )
-        )
-        new_slot_mapping_by_gid: dict[int, torch.Tensor] = {}
-        for kv_cache_gid in draft_kv_cache_group_ids:
-            blk_table_tensor = block_tables_by_gid[kv_cache_gid]
-            block_size = block_size_by_gid[kv_cache_gid]
+        # Update slot_mappings across all KV cache groups
+        assert isinstance(cad.kv_cache_info_by_gid, dict)
+        new_kv_cache_info_by_gid: dict[int, KVCacheInfoForSpecDecode] = {}
+        for gid, kv_cache_info in cad.kv_cache_info_by_gid.items():
             slot_mapping = compute_new_slot_mapping(
                 cad=cad,
                 new_positions=self.positions[:num_tokens],
                 is_rejected_token_mask=is_rejected_tok,
-                block_size=block_size,
+                block_size=kv_cache_info.block_size,
                 max_model_len=self.max_model_len,
-                block_table_tensor=blk_table_tensor,
+                block_table_tensor=kv_cache_info.block_table,
             )
-            new_slot_mapping_by_gid[kv_cache_gid] = slot_mapping
+            new_kv_cache_info_by_gid[gid] = kv_cache_info.replace(
+                slot_mapping=slot_mapping
+            )
         new_cad: CommonAttentionMetadata = cad.replace(
-            slot_mapping_by_gid=new_slot_mapping_by_gid
+            kv_cache_info_by_gid=new_kv_cache_info_by_gid
         )
 
         new_cad = extend_all_queries_by_1(new_cad, arange=self.arange)

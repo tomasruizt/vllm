@@ -312,17 +312,11 @@ class CommonAttentionMetadata:
     block_table_tensor: torch.Tensor
     slot_mapping: torch.Tensor
 
-    # For multi-group KV cache (e.g. speculative decoding): block tables per group.
-    # When set, drafter uses these instead of a single block_table_tensor.
-    block_tables_by_gid: dict[int, torch.Tensor] | None = None
-    # For multi-group KV cache: slot mapping per group (like block_tables_by_gid).
-    slot_mapping_by_gid: dict[int, torch.Tensor] | None = None
-    # For multi-group KV cache: layer name -> kv_cache_group_id (for drafter).
+    # For multi-group KV cache (e.g. speculative decoding)
     layer_to_kv_cache_gid: dict[str, int] | None = None
-    # For multi-group KV cache: block size per group (for drafter slot mapping).
-    block_size_by_gid: dict[int, int] | None = None
-    # For multi-group KV cache: attention metadata builder per group (for drafter).
     metadatabuilder_by_gid: dict[int, "AttentionMetadataBuilder"] | None = None
+
+    kv_cache_info_by_gid: dict[int, "KVCacheInfoForSpecDecode"] | None = None
 
     causal: bool = True
 
@@ -412,25 +406,20 @@ class CommonAttentionMetadata:
             max_seq_len=self.max_seq_len,
             block_table_tensor=self.block_table_tensor[:num_actual_reqs],
             slot_mapping=self.slot_mapping[:num_actual_tokens],
-            block_tables_by_gid=(
-                {
-                    gid: t[:num_actual_reqs]
-                    for gid, t in self.block_tables_by_gid.items()
-                }
-                if self.block_tables_by_gid is not None
-                else None
-            ),
-            slot_mapping_by_gid=(
-                {
-                    gid: t[:num_actual_tokens]
-                    for gid, t in self.slot_mapping_by_gid.items()
-                }
-                if self.slot_mapping_by_gid is not None
-                else None
-            ),
             layer_to_kv_cache_gid=self.layer_to_kv_cache_gid,
-            block_size_by_gid=self.block_size_by_gid,
-            metadatabuilder_by_gid=self.metadatabuilder_by_gid,
+            kv_cache_info_by_gid=(
+                {
+                    gid: KVCacheInfoForSpecDecode(
+                        block_size=info.block_size,
+                        block_table=info.block_table[:num_actual_reqs],
+                        slot_mapping=info.slot_mapping[:num_actual_tokens],
+                        attention_metadata_builder=info.attention_metadata_builder,
+                    )
+                    for gid, info in self.kv_cache_info_by_gid.items()
+                }
+                if self.kv_cache_info_by_gid is not None
+                else None
+            ),
             causal=self.causal,
             logits_indices_padded=self.logits_indices_padded,
             num_logits_indices=self.num_logits_indices,
@@ -439,6 +428,19 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
         )
+
+
+@dataclass
+class KVCacheInfoForSpecDecode:
+    """Data about a single KV-Cache Group used for spec-decode."""
+
+    block_size: int
+    block_table: torch.Tensor
+    slot_mapping: torch.Tensor
+    attention_metadata_builder: "AttentionMetadataBuilder"
+
+    def replace(self, **kwargs) -> "KVCacheInfoForSpecDecode":
+        return replace(self, **kwargs)
 
 
 M = TypeVar("M")

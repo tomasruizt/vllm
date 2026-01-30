@@ -30,6 +30,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    KVCacheInfoForSpecDecode,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.attention.backends.tree_attn import (
@@ -260,8 +261,7 @@ class SpecDecodeBaseProposer:
         self,
         num_tokens: int,
         layer_to_kv_cache_gid: dict[str, int],
-        draft_kv_cache_group_ids: list[int],
-        slot_mapping_by_gid: dict[int, torch.Tensor],
+        kv_cache_info_by_gid: dict[int, KVCacheInfoForSpecDecode],
     ) -> dict[str, torch.Tensor]:
         """Return slot_mapping dict for EAGLE/draft layers during inference.
 
@@ -269,9 +269,9 @@ class SpecDecodeBaseProposer:
         per-gid buffers and returns views into those buffers.
         """
         # COPY
-        for gid in draft_kv_cache_group_ids:
+        for gid, kv_cache_info in kv_cache_info_by_gid.items():
             buf = self._slot_mapping_buffer_by_gid[gid]
-            src = slot_mapping_by_gid[gid]
+            src = kv_cache_info.slot_mapping
             n = min(num_tokens, src.shape[0])
             buf[:n].copy_(src[:n])
             if n < num_tokens:
@@ -345,23 +345,8 @@ class SpecDecodeBaseProposer:
         assert self.runner is not None
 
         # Per-group block tables, block sizes, slot mappings (from common_attn_metadata)
-        assert isinstance(common_attn_metadata.block_tables_by_gid, dict)
-        assert isinstance(common_attn_metadata.slot_mapping_by_gid, dict)
         assert isinstance(common_attn_metadata.layer_to_kv_cache_gid, dict)
-        assert isinstance(common_attn_metadata.block_size_by_gid, dict)
-        assert isinstance(common_attn_metadata.metadatabuilder_by_gid, dict)
-
-        block_tables_by_gid = common_attn_metadata.block_tables_by_gid
         layer_to_kv_cache_gid = common_attn_metadata.layer_to_kv_cache_gid
-        block_size_by_gid = common_attn_metadata.block_size_by_gid
-        metadatabuilder_by_gid = common_attn_metadata.metadatabuilder_by_gid
-        draft_kv_cache_group_ids = sorted(
-            set(
-                gid
-                for layer_name, gid in layer_to_kv_cache_gid.items()
-                if layer_name in self.attn_layer_names
-            )
-        )
 
         num_tokens, last_token_indices, common_attn_metadata = (
             self.set_inputs_first_pass(
@@ -378,20 +363,13 @@ class SpecDecodeBaseProposer:
         per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
 
         attn_metadata_by_gid: dict[int, AttentionMetadata] = {}
-        for kv_cache_gid in draft_kv_cache_group_ids:
-            blk_table_tensor = block_tables_by_gid[kv_cache_gid]
-            slot_mapping = common_attn_metadata.slot_mapping_by_gid[kv_cache_gid]
-
-            cm = common_attn_metadata.replace(
-                block_table_tensor=blk_table_tensor,
-                slot_mapping=slot_mapping,
+        for gid, kv_cache_info in common_attn_metadata.kv_cache_info_by_gid.items():
+            attn_metadata = kv_cache_info.attention_metadata_builder.build_for_drafting(
+                common_attn_metadata=common_attn_metadata, draft_index=0
             )
-
-            builder = metadatabuilder_by_gid[kv_cache_gid]
-            attn_metadata = builder.build_for_drafting(
-                common_attn_metadata=cm, draft_index=0
-            )
-            attn_metadata_by_gid[kv_cache_gid] = attn_metadata
+            attn_metadata.slot_mapping = kv_cache_info.slot_mapping
+            attn_metadata.block_table = kv_cache_info.block_table
+            attn_metadata_by_gid[gid] = attn_metadata
 
         for layer_name in self.attn_layer_names:
             gid = layer_to_kv_cache_gid[layer_name]
@@ -460,8 +438,7 @@ class SpecDecodeBaseProposer:
             slot_mapping=self._get_slot_mapping_buffer_for_inference(
                 num_tokens=num_input_tokens,
                 layer_to_kv_cache_gid=layer_to_kv_cache_gid,
-                draft_kv_cache_group_ids=draft_kv_cache_group_ids,
-                slot_mapping_by_gid=common_attn_metadata.slot_mapping_by_gid,
+                kv_cache_info_by_gid=common_attn_metadata.kv_cache_info_by_gid,
             ),
         ):
             ret_hidden_states = self.model(**model_kwargs)
@@ -599,13 +576,13 @@ class SpecDecodeBaseProposer:
                 common_attn_metadata._num_computed_tokens_cpu += 1
 
             # Compute per-group slot mappings and rebuild attention metadata.
-            new_slot_mapping_by_gid: dict[int, torch.Tensor] = {}
             attn_metadata_by_gid = {}
-            for kv_cache_gid in draft_kv_cache_group_ids:
-                blk_table_tensor = block_tables_by_gid[kv_cache_gid]
+            new_kv_cache_info_by_gid: dict[int, KVCacheInfoForSpecDecode] = {}
+            for gid, kv_cache_info in common_attn_metadata.kv_cache_info_by_gid.items():
+                blk_table_tensor = kv_cache_info.block_table
 
                 # Compute per-group block_size and block_numbers
-                group_block_size = block_size_by_gid[kv_cache_gid]
+                group_block_size = kv_cache_info.block_size
                 if self.uses_mrope:
                     group_block_numbers = clamped_positions[0] // group_block_size
                 else:
@@ -626,22 +603,22 @@ class SpecDecodeBaseProposer:
                         + clamped_positions % group_block_size
                     )
                 slot_mapping.masked_fill_(exceeds_max_model_len, PADDING_SLOT_ID)
-                new_slot_mapping_by_gid[kv_cache_gid] = slot_mapping
-
-                cm = common_attn_metadata.replace(
-                    block_table_tensor=blk_table_tensor,
-                    slot_mapping=slot_mapping,
+                new_kv_cache_info_by_gid[gid] = kv_cache_info.replace(
+                    slot_mapping=slot_mapping
                 )
 
-                builder = metadatabuilder_by_gid[kv_cache_gid]
+                builder = kv_cache_info.attention_metadata_builder
                 attn_metadata = builder.build_for_drafting(
-                    common_attn_metadata=cm, draft_index=token_index + 1
+                    common_attn_metadata=common_attn_metadata,
+                    draft_index=token_index + 1,
                 )
-                attn_metadata_by_gid[kv_cache_gid] = attn_metadata
+                attn_metadata.slot_mapping = slot_mapping
+                attn_metadata.block_table = blk_table_tensor
+
+                attn_metadata_by_gid[gid] = attn_metadata
 
             common_attn_metadata = common_attn_metadata.replace(
-                slot_mapping_by_gid=new_slot_mapping_by_gid,
-                slot_mapping=new_slot_mapping_by_gid[draft_kv_cache_group_ids[0]],
+                kv_cache_info_by_gid=new_kv_cache_info_by_gid
             )
 
             for layer_name in self.attn_layer_names:
@@ -679,8 +656,7 @@ class SpecDecodeBaseProposer:
                 slot_mapping=self._get_slot_mapping_buffer_for_inference(
                     num_tokens=input_batch_size,
                     layer_to_kv_cache_gid=layer_to_kv_cache_gid,
-                    draft_kv_cache_group_ids=draft_kv_cache_group_ids,
-                    slot_mapping_by_gid=common_attn_metadata.slot_mapping_by_gid,
+                    kv_cache_info_by_gid=common_attn_metadata.kv_cache_info_by_gid,
                 ),
             ):
                 ret_hidden_states = self.model(**model_kwargs)
@@ -859,7 +835,6 @@ class SpecDecodeBaseProposer:
 
         total_num_tokens = query_start_loc_cpu[-1].item()
 
-        assert isinstance(common_attn_metadata.slot_mapping_by_gid, dict)
         spec_common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=common_attn_metadata.query_start_loc,
             seq_lens=common_attn_metadata.seq_lens,
@@ -872,14 +847,8 @@ class SpecDecodeBaseProposer:
             max_seq_len=common_attn_metadata.seq_lens_cpu.max().item(),
             block_table_tensor=torch.empty(0),  # block_table_tensor is set in propose()
             slot_mapping=torch.empty(0),  # slot_mapping is set in propose()
-            block_tables_by_gid=common_attn_metadata.block_tables_by_gid,
-            slot_mapping_by_gid={
-                gid: t[:total_num_tokens]
-                for gid, t in common_attn_metadata.slot_mapping_by_gid.items()
-            },
+            kv_cache_info_by_gid=common_attn_metadata.kv_cache_info_by_gid,
             layer_to_kv_cache_gid=common_attn_metadata.layer_to_kv_cache_gid,
-            block_size_by_gid=common_attn_metadata.block_size_by_gid,
-            metadatabuilder_by_gid=common_attn_metadata.metadatabuilder_by_gid,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
@@ -911,13 +880,6 @@ class SpecDecodeBaseProposer:
 
         layer_to_kv_cache_gid = common_attn_metadata.layer_to_kv_cache_gid
         assert isinstance(layer_to_kv_cache_gid, dict)
-        draft_kv_cache_group_ids = sorted(
-            set(
-                gid
-                for layer_name, gid in layer_to_kv_cache_gid.items()
-                if layer_name in self.attn_layer_names
-            )
-        )
 
         total_num_drafts = self.cu_drafts_per_level[0]
         level_num_drafts = total_num_drafts
@@ -1006,7 +968,7 @@ class SpecDecodeBaseProposer:
             attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
 
             # Compute the slot mapping (tree uses first KV cache group, gid 0).
-            block_size = common_attn_metadata.block_size_by_gid[0]
+            block_size = common_attn_metadata.kv_cache_info_by_gid[0].block_size
             query_positions = flattened_draft_positions[:, level : level + query_len]
             block_numbers = query_positions // block_size
             block_ids = attn_metadata.block_table.gather(dim=1, index=block_numbers)
@@ -1037,8 +999,7 @@ class SpecDecodeBaseProposer:
                 slot_mapping=self._get_slot_mapping_buffer_for_inference(
                     num_tokens=num_input_tokens,
                     layer_to_kv_cache_gid=layer_to_kv_cache_gid,
-                    draft_kv_cache_group_ids=draft_kv_cache_group_ids,
-                    slot_mapping_by_gid=common_attn_metadata.slot_mapping_by_gid,
+                    kv_cache_info_by_gid=common_attn_metadata.kv_cache_info_by_gid,
                 ),
             ):
                 last_hidden_states, hidden_states = self.model(
@@ -1160,7 +1121,6 @@ class SpecDecodeBaseProposer:
         token_indices_np = token_offests + old_query_start_locs_expanded
         token_indices = torch.from_numpy(token_indices_np).to(device, non_blocking=True)
 
-        assert isinstance(common_attn_metadata.slot_mapping_by_gid, dict)
         spec_common_attn_metadata = CommonAttentionMetadata(
             query_start_loc=new_query_start_loc_cpu.to(device, non_blocking=True),
             seq_lens=new_seq_lens_cpu.to(device, non_blocking=True),
@@ -1173,14 +1133,8 @@ class SpecDecodeBaseProposer:
             max_seq_len=new_seq_lens_cpu.max().item(),
             block_table_tensor=torch.empty(0),  # block_table_tensor is set in propose()
             slot_mapping=torch.empty(0),  # slot_mapping is set in propose()
-            block_tables_by_gid=common_attn_metadata.block_tables_by_gid,
-            slot_mapping_by_gid={
-                gid: t[token_indices]
-                for gid, t in common_attn_metadata.slot_mapping_by_gid.items()
-            },
             layer_to_kv_cache_gid=common_attn_metadata.layer_to_kv_cache_gid,
-            block_size_by_gid=common_attn_metadata.block_size_by_gid,
-            metadatabuilder_by_gid=common_attn_metadata.metadatabuilder_by_gid,
+            kv_cache_info_by_gid=common_attn_metadata.kv_cache_info_by_gid,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )

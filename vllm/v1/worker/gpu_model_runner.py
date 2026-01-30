@@ -104,6 +104,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     AttentionType,
     CommonAttentionMetadata,
+    KVCacheInfoForSpecDecode,
     MultipleOf,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
@@ -112,6 +113,7 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
+from vllm.v1.core.kv_cache_utils import DRAFT_MODEL_PREFIX
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -178,6 +180,7 @@ from .utils import (
     MultiModalBudget,
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
+    layer_names_to_kv_cache_group_id,
     sanity_check_mm_encoder_outputs,
 )
 
@@ -1815,29 +1818,6 @@ class GPUModelRunner(
         # in the same group share the same metadata.
         spec_decode_common_attn_metadata = None
 
-        # Block tables, block sizes, layer->gid, metadatabuilder_by_gid for spec decode
-        block_tables_by_gid: dict[int, torch.Tensor] | None = None
-        block_size_by_gid: dict[int, int] | None = None
-        layer_to_kv_cache_gid: dict[str, int] | None = None
-        metadatabuilder_by_gid: dict[int, AttentionMetadataBuilder] | None = None
-        if self.speculative_config:
-            block_tables_by_gid = {
-                gid: _get_block_table(gid) for gid in range(len(kv_cache_groups))
-            }
-            block_size_by_gid = {
-                gid: kv_cache_groups[gid].kv_cache_spec.block_size
-                for gid in range(len(kv_cache_groups))
-            }
-            layer_to_kv_cache_gid = {}
-            for gid in range(len(self.attn_groups)):
-                for attn_group in self.attn_groups[gid]:
-                    for layer_name in attn_group.layer_names:
-                        layer_to_kv_cache_gid[layer_name] = gid
-            metadatabuilder_by_gid = {
-                gid: self.attn_groups[gid][0].get_metadata_builder()
-                for gid in range(len(self.attn_groups))
-            }
-
         for kv_cache_gid, kv_cache_group in enumerate(kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
 
@@ -1861,11 +1841,27 @@ class GPUModelRunner(
 
                 sd_cm = spec_decode_common_attn_metadata
                 if sd_cm is not None:
-                    sd_cm.block_tables_by_gid = block_tables_by_gid
-                    sd_cm.slot_mapping_by_gid = slot_mappings
-                    sd_cm.layer_to_kv_cache_gid = layer_to_kv_cache_gid
-                    sd_cm.block_size_by_gid = block_size_by_gid
-                    sd_cm.metadatabuilder_by_gid = metadatabuilder_by_gid
+                    # Speculative Decoding requires Information about each KVCache Group
+                    # Below we instantiate this information and pass it over
+                    # CommonAttentionMetadata
+                    sd_cm.layer_to_kv_cache_gid = layer_names_to_kv_cache_group_id(
+                        self.attn_groups, only_prefix=DRAFT_MODEL_PREFIX
+                    )
+
+                    draft_gids = set(sd_cm.layer_to_kv_cache_gid.values())
+                    kv_cache_info_by_gid: dict[int, KVCacheInfoForSpecDecode] = {}
+                    for gid, kv_cache_group in enumerate(kv_cache_groups):
+                        if gid not in draft_gids:
+                            continue  # Skip non-draft KV cache groups
+
+                        builder = self.attn_groups[gid][0].get_metadata_builder()
+                        kv_cache_info_by_gid[gid] = KVCacheInfoForSpecDecode(
+                            block_size=kv_cache_group.kv_cache_spec.block_size,
+                            block_table=_get_block_table(gid),
+                            slot_mapping=slot_mappings[gid],
+                            attention_metadata_builder=builder,
+                        )
+                    sd_cm.kv_cache_info_by_gid = kv_cache_info_by_gid
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
