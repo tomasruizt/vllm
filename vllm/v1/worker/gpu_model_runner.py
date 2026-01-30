@@ -1851,7 +1851,6 @@ class GPUModelRunner(
                     kv_cache_info_by_gid: dict[int, KVCacheInfoForSpecDecode] = {}
                     for gid, kv_cache_group in enumerate(kv_cache_groups):
                         kv_cache_info_by_gid[gid] = KVCacheInfoForSpecDecode(
-                            block_size=kv_cache_group.kv_cache_spec.block_size,
                             block_table=_get_block_table(gid),
                             slot_mapping=slot_mappings[gid],
                         )

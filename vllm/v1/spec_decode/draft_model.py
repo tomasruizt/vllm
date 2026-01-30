@@ -133,7 +133,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
                 cad=cad,
                 new_positions=self.positions[:num_tokens],
                 is_rejected_token_mask=is_rejected_tok,
-                block_size=kv_cache_info.block_size,
+                block_size=self._get_metadata_builder(gid).kv_cache_spec.block_size,
                 max_model_len=self.max_model_len,
                 block_table_tensor=kv_cache_info.block_table,
             )

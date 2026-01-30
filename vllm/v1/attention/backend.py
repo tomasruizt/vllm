@@ -406,7 +406,6 @@ class CommonAttentionMetadata:
             kv_cache_info_by_gid=(
                 {
                     gid: KVCacheInfoForSpecDecode(
-                        block_size=info.block_size,
                         block_table=info.block_table[:num_actual_reqs],
                         slot_mapping=info.slot_mapping[:num_actual_tokens],
                     )
@@ -429,7 +428,6 @@ class CommonAttentionMetadata:
 class KVCacheInfoForSpecDecode:
     """Data about a single KV-Cache Group used for spec-decode."""
 
-    block_size: int
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
 

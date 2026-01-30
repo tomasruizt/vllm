@@ -587,7 +587,8 @@ class SpecDecodeBaseProposer:
                 blk_table_tensor = kv_cache_info.block_table
 
                 # Compute per-group block_size and block_numbers
-                group_block_size = kv_cache_info.block_size
+                builder = self._get_metadata_builder(gid)
+                group_block_size = builder.kv_cache_spec.block_size
                 if self.uses_mrope:
                     group_block_numbers = clamped_positions[0] // group_block_size
                 else:
@@ -612,7 +613,6 @@ class SpecDecodeBaseProposer:
                     slot_mapping=slot_mapping
                 )
 
-                builder = self._get_metadata_builder(gid)
                 attn_metadata = builder.build_for_drafting(
                     common_attn_metadata=common_attn_metadata,
                     draft_index=token_index + 1,

@@ -117,7 +117,6 @@ def create_common_attn_metadata(
         slot_mapping=slot_mapping,
         kv_cache_info_by_gid={
             0: KVCacheInfoForSpecDecode(
-                block_size=block_size,
                 block_table=block_table_tensor,
                 slot_mapping=slot_mapping,
             )
