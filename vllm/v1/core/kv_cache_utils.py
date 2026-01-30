@@ -74,6 +74,10 @@ def maybe_convert_block_hash(hash_bytes: BlockHash) -> ExternalBlockHash:
 
 logger = init_logger(__name__)
 
+# Prefix for draft model layer names in the KV cache (e.g. "draft_model.layers.0.attn").
+# Must match the prefix passed to get_model() when loading the draft model.
+DRAFT_MODEL_PREFIX = "draft_model"
+
 # The hash seed for the first block of any prefix block sequence.
 #
 # We use a random value to avoid hash collisions or PYTHONHASHSEED environment
@@ -1018,7 +1022,7 @@ def _get_kv_cache_groups_uniform_page_size(
     # cross-contamination during speculative decoding.
     same_type_layers: dict[tuple[KVCacheSpec, bool], list[str]] = defaultdict(list)
     for layer_name, layer_spec in kv_cache_spec.items():
-        is_draft_layer = layer_name.startswith("draft_model.")
+        is_draft_layer = layer_name.startswith(DRAFT_MODEL_PREFIX)
         same_type_layers[(layer_spec, is_draft_layer)].append(layer_name)
 
     # Split each group into smaller groups, to make the number of layers in each

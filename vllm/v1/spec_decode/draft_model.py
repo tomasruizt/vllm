@@ -14,6 +14,7 @@ from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
     extend_all_queries_by_1,
 )
+from vllm.v1.core.kv_cache_utils import DRAFT_MODEL_PREFIX
 from vllm.v1.spec_decode.eagle import PADDING_SLOT_ID, SpecDecodeBaseProposer
 
 logger = init_logger(__name__)
@@ -184,7 +185,9 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             draft_vllm_config.parallel_config.rank,
         )
         with set_model_tag("draft_model"):
-            self.model = get_model(vllm_config=draft_vllm_config, prefix="draft_model")
+            self.model = get_model(
+                vllm_config=draft_vllm_config, prefix=DRAFT_MODEL_PREFIX
+            )
 
         # This must be computed after loading the draft model
         # because that mutates the forward_context of the vllm_config
