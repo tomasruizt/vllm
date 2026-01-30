@@ -113,7 +113,6 @@ from vllm.v1.attention.backends.utils import (
     get_dcp_local_seq_lens,
     reorder_batch_to_split_decodes_and_prefills,
 )
-from vllm.v1.core.kv_cache_utils import DRAFT_MODEL_PREFIX
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
 from vllm.v1.kv_cache_interface import (
@@ -180,7 +179,6 @@ from .utils import (
     MultiModalBudget,
     add_kv_sharing_layers_to_kv_cache_groups,
     bind_kv_cache,
-    layer_names_to_kv_cache_group_id,
     sanity_check_mm_encoder_outputs,
 )
 
@@ -1850,22 +1848,12 @@ class GPUModelRunner(
                     # Speculative Decoding requires Information about each KVCache Group
                     # Below we instantiate this information and pass it over
                     # CommonAttentionMetadata
-                    sd_cm.layer_to_kv_cache_gid = layer_names_to_kv_cache_group_id(
-                        self.attn_groups, only_prefix=DRAFT_MODEL_PREFIX
-                    )
-
-                    draft_gids = set(sd_cm.layer_to_kv_cache_gid.values())
                     kv_cache_info_by_gid: dict[int, KVCacheInfoForSpecDecode] = {}
                     for gid, kv_cache_group in enumerate(kv_cache_groups):
-                        if gid not in draft_gids:
-                            continue  # Skip non-draft KV cache groups
-
-                        builder = self.attn_groups[gid][0].get_metadata_builder()
                         kv_cache_info_by_gid[gid] = KVCacheInfoForSpecDecode(
                             block_size=kv_cache_group.kv_cache_spec.block_size,
                             block_table=_get_block_table(gid),
                             slot_mapping=slot_mappings[gid],
-                            attention_metadata_builder=builder,
                         )
                     sd_cm.kv_cache_info_by_gid = kv_cache_info_by_gid
 

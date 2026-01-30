@@ -313,9 +313,6 @@ class CommonAttentionMetadata:
     slot_mapping: torch.Tensor
 
     # For multi-group KV cache (e.g. speculative decoding)
-    layer_to_kv_cache_gid: dict[str, int] | None = None
-    metadatabuilder_by_gid: dict[int, "AttentionMetadataBuilder"] | None = None
-
     kv_cache_info_by_gid: dict[int, "KVCacheInfoForSpecDecode"] | None = None
 
     causal: bool = True
@@ -406,14 +403,12 @@ class CommonAttentionMetadata:
             max_seq_len=self.max_seq_len,
             block_table_tensor=self.block_table_tensor[:num_actual_reqs],
             slot_mapping=self.slot_mapping[:num_actual_tokens],
-            layer_to_kv_cache_gid=self.layer_to_kv_cache_gid,
             kv_cache_info_by_gid=(
                 {
                     gid: KVCacheInfoForSpecDecode(
                         block_size=info.block_size,
                         block_table=info.block_table[:num_actual_reqs],
                         slot_mapping=info.slot_mapping[:num_actual_tokens],
-                        attention_metadata_builder=info.attention_metadata_builder,
                     )
                     for gid, info in self.kv_cache_info_by_gid.items()
                 }
@@ -437,7 +432,6 @@ class KVCacheInfoForSpecDecode:
     block_size: int
     block_table: torch.Tensor
     slot_mapping: torch.Tensor
-    attention_metadata_builder: "AttentionMetadataBuilder"
 
     def replace(self, **kwargs) -> "KVCacheInfoForSpecDecode":
         return replace(self, **kwargs)

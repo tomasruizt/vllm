@@ -566,10 +566,10 @@ def test_propose(method, attn_backend, num_speculative_tokens, monkeypatch):
 
     # Mock runner for attention metadata building
     proposer.runner = mock.MagicMock()
-    proposer.runner.attn_groups.append([mock.MagicMock()])
-    proposer.runner.attn_groups[0][
-        0
-    ].get_metadata_builder.return_value = attn_metadata_builder
+    attn_group = mock.MagicMock()
+    attn_group.get_metadata_builder.return_value = attn_metadata_builder
+    attn_group.layer_names = proposer.attn_layer_names
+    proposer.runner.attn_groups = [[attn_group]]
     proposer._get_attention_metadata_builder = mock.MagicMock(
         return_value=attn_metadata_builder
     )
@@ -702,11 +702,11 @@ def test_propose_tree(spec_token_tree):
 
     # Mock runner for attention metadata building.
     proposer.runner = mock.MagicMock()
-    proposer.runner.attn_groups.append([mock.MagicMock()])
-    proposer.runner.attn_groups[0][0].metadata_builders = [attn_metadata_builder]
-    proposer.runner.attn_groups[0][
-        0
-    ].get_metadata_builder.return_value = attn_metadata_builder
+    attn_group = mock.MagicMock()
+    attn_group.layer_names = proposer.attn_layer_names
+    attn_group.metadata_builders = [attn_metadata_builder]
+    attn_group.get_metadata_builder.return_value = attn_metadata_builder
+    proposer.runner.attn_groups = [[attn_group]]
     proposer._get_attention_metadata_builder = mock.MagicMock(
         return_value=attn_metadata_builder
     )

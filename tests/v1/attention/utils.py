@@ -22,6 +22,7 @@ from vllm.v1.attention.backend import (
     AttentionImpl,
     AttentionMetadataBuilder,
     CommonAttentionMetadata,
+    KVCacheInfoForSpecDecode,
 )
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -114,6 +115,13 @@ def create_common_attn_metadata(
         max_seq_len=max_seq_len,
         block_table_tensor=block_table_tensor,
         slot_mapping=slot_mapping,
+        kv_cache_info_by_gid={
+            0: KVCacheInfoForSpecDecode(
+                block_size=block_size,
+                block_table=block_table_tensor,
+                slot_mapping=slot_mapping,
+            )
+        },
         causal=True,
     )
 

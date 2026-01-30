@@ -3,6 +3,7 @@
 import ast
 from collections import defaultdict
 from dataclasses import replace
+from functools import cached_property
 from importlib.util import find_spec
 
 import numpy as np
@@ -49,6 +50,7 @@ from vllm.v1.spec_decode.utils import (
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.utils import layer_names_to_kv_cache_group_id
 
 logger = init_logger(__name__)
 
@@ -229,6 +231,10 @@ class SpecDecodeBaseProposer:
             1, len(self.tree_choices) + 1, device=device, dtype=torch.int32
         ).repeat(max_batch_size, 1)
 
+    @cached_property
+    def layer_names_to_kv_cache_gid(self) -> dict[str, int]:
+        return layer_names_to_kv_cache_group_id(self.runner.attn_groups)
+
     def _get_positions(self, num_tokens: int):
         if self.uses_mrope:
             return self.mrope_positions[:, :num_tokens]
@@ -260,7 +266,6 @@ class SpecDecodeBaseProposer:
     def _get_slot_mapping_buffer_for_inference(
         self,
         num_tokens: int,
-        layer_to_kv_cache_gid: dict[str, int],
         kv_cache_info_by_gid: dict[int, KVCacheInfoForSpecDecode],
     ) -> dict[str, torch.Tensor]:
         """Return slot_mapping dict for EAGLE/draft layers during inference.
@@ -281,7 +286,7 @@ class SpecDecodeBaseProposer:
         layer_to_buffer: dict[str, torch.Tensor] = {}
         layer_names = [*self.attn_layer_names, *self.indexer_layer_names]
         for layer_name in layer_names:
-            gid = layer_to_kv_cache_gid[layer_name]
+            gid = self.layer_names_to_kv_cache_gid[layer_name]
             buf = self._slot_mapping_buffer_by_gid[gid][:num_tokens]
             layer_to_buffer[layer_name] = buf
 
@@ -345,9 +350,7 @@ class SpecDecodeBaseProposer:
         assert self.runner is not None
 
         # Per-group block tables, block sizes, slot mappings (from common_attn_metadata)
-        assert isinstance(common_attn_metadata.layer_to_kv_cache_gid, dict)
         assert isinstance(common_attn_metadata.kv_cache_info_by_gid, dict)
-        layer_to_kv_cache_gid = common_attn_metadata.layer_to_kv_cache_gid
 
         num_tokens, last_token_indices, common_attn_metadata = (
             self.set_inputs_first_pass(
@@ -366,7 +369,8 @@ class SpecDecodeBaseProposer:
 
         attn_metadata_by_gid: dict[int, AttentionMetadata] = {}
         for gid, kv_cache_info in common_attn_metadata.kv_cache_info_by_gid.items():
-            attn_metadata = kv_cache_info.attention_metadata_builder.build_for_drafting(
+            builder = self._get_metadata_builder(gid)
+            attn_metadata = builder.build_for_drafting(
                 common_attn_metadata=common_attn_metadata, draft_index=0
             )
             attn_metadata.slot_mapping = kv_cache_info.slot_mapping
@@ -374,7 +378,7 @@ class SpecDecodeBaseProposer:
             attn_metadata_by_gid[gid] = attn_metadata
 
         for layer_name in self.attn_layer_names:
-            gid = layer_to_kv_cache_gid[layer_name]
+            gid = self.layer_names_to_kv_cache_gid[layer_name]
             per_layer_attn_metadata[layer_name] = attn_metadata_by_gid[gid]
 
         # FIXME: support hybrid kv for draft model (remove separate indexer)
@@ -439,7 +443,6 @@ class SpecDecodeBaseProposer:
             cudagraph_runtime_mode=cudagraph_runtime_mode,
             slot_mapping=self._get_slot_mapping_buffer_for_inference(
                 num_tokens=num_input_tokens,
-                layer_to_kv_cache_gid=layer_to_kv_cache_gid,
                 kv_cache_info_by_gid=common_attn_metadata.kv_cache_info_by_gid,
             ),
         ):
@@ -609,7 +612,7 @@ class SpecDecodeBaseProposer:
                     slot_mapping=slot_mapping
                 )
 
-                builder = kv_cache_info.attention_metadata_builder
+                builder = self._get_metadata_builder(gid)
                 attn_metadata = builder.build_for_drafting(
                     common_attn_metadata=common_attn_metadata,
                     draft_index=token_index + 1,
@@ -624,7 +627,7 @@ class SpecDecodeBaseProposer:
             )
 
             for layer_name in self.attn_layer_names:
-                gid = layer_to_kv_cache_gid[layer_name]
+                gid = self.layer_names_to_kv_cache_gid[layer_name]
                 per_layer_attn_metadata[layer_name] = attn_metadata_by_gid[gid]
 
             # copy inputs to buffer for cudagraph
@@ -659,7 +662,6 @@ class SpecDecodeBaseProposer:
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping_buffer_for_inference(
                     num_tokens=input_batch_size,
-                    layer_to_kv_cache_gid=layer_to_kv_cache_gid,
                     kv_cache_info_by_gid=kv_cache_info_by_gid,
                 ),
             ):
@@ -852,7 +854,6 @@ class SpecDecodeBaseProposer:
             block_table_tensor=torch.empty(0),  # block_table_tensor is set in propose()
             slot_mapping=torch.empty(0),  # slot_mapping is set in propose()
             kv_cache_info_by_gid=common_attn_metadata.kv_cache_info_by_gid,
-            layer_to_kv_cache_gid=common_attn_metadata.layer_to_kv_cache_gid,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
@@ -882,8 +883,6 @@ class SpecDecodeBaseProposer:
         ].get_metadata_builder()
         assert isinstance(tree_attn_metadata_builder, TreeAttentionMetadataBuilder)
 
-        layer_to_kv_cache_gid = common_attn_metadata.layer_to_kv_cache_gid
-        assert isinstance(layer_to_kv_cache_gid, dict)
         assert common_attn_metadata.kv_cache_info_by_gid is not None
 
         total_num_drafts = self.cu_drafts_per_level[0]
@@ -1005,7 +1004,6 @@ class SpecDecodeBaseProposer:
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
                 slot_mapping=self._get_slot_mapping_buffer_for_inference(
                     num_tokens=num_input_tokens,
-                    layer_to_kv_cache_gid=layer_to_kv_cache_gid,
                     kv_cache_info_by_gid=kv_cache_info_by_gid,
                 ),
             ):
@@ -1140,7 +1138,6 @@ class SpecDecodeBaseProposer:
             max_seq_len=new_seq_lens_cpu.max().item(),
             block_table_tensor=torch.empty(0),  # block_table_tensor is set in propose()
             slot_mapping=torch.empty(0),  # slot_mapping is set in propose()
-            layer_to_kv_cache_gid=common_attn_metadata.layer_to_kv_cache_gid,
             kv_cache_info_by_gid=common_attn_metadata.kv_cache_info_by_gid,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
@@ -1400,6 +1397,9 @@ class SpecDecodeBaseProposer:
                 if self.pass_hidden_states_to_model:
                     kwargs["hidden_states"] = self.hidden_states[:num_input_tokens]
                 self.model(**kwargs)
+
+    def _get_metadata_builder(self, kv_cache_group_id: int) -> AttentionMetadataBuilder:
+        return self.runner.attn_groups[kv_cache_group_id][0].get_metadata_builder()
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
         """
