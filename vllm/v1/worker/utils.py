@@ -399,7 +399,7 @@ def is_residual_scattered_for_sp(
 
 def layer_names_to_kv_cache_group_id(
     attn_groups: list[list[AttentionGroup]],
-    only_prefix: str = "",  # Note that str.startswith("") is True"
+    only_prefix: str = "",  # Note that str.startswith("") is True
 ) -> dict[str, int]:
     layer_to_kv_cache_gid = {}
     for group_id, listof_attn_groups in enumerate(attn_groups):
