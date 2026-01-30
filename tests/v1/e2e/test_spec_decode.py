@@ -658,8 +658,8 @@ cases = [
         draft_model="google/gemma-3-270m-it",
         sampling_config=greedy_sampling(),
         num_speculative_tokens=3,
-        expected_acceptance_len=3 + 1,
-        expected_acceptance_rate=1.0,
+        expected_acceptance_len=4,
+        expected_acceptance_rate=1,
     ),
 ]
 
@@ -782,6 +782,7 @@ def assert_draft_model_correctness(args: ArgsTest, enforce_eager: bool):
         tensor_parallel_size=args.target_tensor_parallel_size,
         enforce_eager=enforce_eager,
         disable_log_stats=False,  # enables get_metrics()
+        attention_config={"backend": "FLASH_ATTN"},  # Required for batch invariance
     )
     # we don't check the outputs, only check the metrics
     spec_llm.chat(test_prompts, args.sampling_config)

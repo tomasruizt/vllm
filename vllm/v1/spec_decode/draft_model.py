@@ -193,8 +193,6 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             - target_attn_layer_names
         )
         self.attn_layer_names = list(draft_attn_layer_names)
-        # layer_to_kv_cache_gid and draft_kv_cache_group_ids come from
-        # CommonAttentionMetadata in set_inputs_first_pass() / propose()
 
 
 def create_vllm_config_for_draft_model(
