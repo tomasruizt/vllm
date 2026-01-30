@@ -151,12 +151,11 @@ class DraftModelProposer(SpecDecodeBaseProposer):
                 block_table_tensor=blk_table_tensor,
             )
             new_slot_mapping_by_gid[kv_cache_gid] = slot_mapping
-
-        new_cad: CommonAttentionMetadata = extend_all_queries_by_1(
-            cad,
-            arange=self.arange,
-            slot_mapping_by_gid=new_slot_mapping_by_gid,
+        new_cad: CommonAttentionMetadata = cad.replace(
+            slot_mapping_by_gid=new_slot_mapping_by_gid
         )
+
+        new_cad = extend_all_queries_by_1(new_cad, arange=self.arange)
 
         new_last_token_indices = new_cad.query_start_loc[1:] - 1
         if num_rejected_tokens_gpu is not None:
