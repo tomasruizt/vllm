@@ -631,6 +631,8 @@ class ArgsTest:
     gpu_memory_utilization: float = 0.5
     dataset: str = "test_prompts"
     num_prompts: int = 100
+    # Some settings only get 100% acceptance_rate with VLLM_BATCH_INVARIANT=1
+    use_batch_invariance: bool = False
 
 
 cases = [
@@ -660,13 +662,19 @@ cases = [
         num_speculative_tokens=3,
         expected_acceptance_len=4,
         expected_acceptance_rate=1,
+        # Without batch invariance, acceptance rate is ~86%
+        use_batch_invariance=True,
     ),
 ]
 
 
 @pytest.mark.parametrize("args", cases)
 @pytest.mark.parametrize("enforce_eager", [True, False])
-def test_draft_model_correctness(args: ArgsTest, enforce_eager: bool):
+def test_draft_model_correctness(
+    args: ArgsTest, enforce_eager: bool, monkeypatch: pytest.MonkeyPatch
+):
+    if args.use_batch_invariance:
+        monkeypatch.setenv("VLLM_BATCH_INVARIANT", "1")
     assert_draft_model_correctness(args, enforce_eager)
 
 
