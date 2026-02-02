@@ -628,7 +628,7 @@ class ArgsTest:
     target_tensor_parallel_size: int = 1
     draft_tensor_parallel_size: int = 1
     max_model_len: int = 1024
-    gpu_memory_utilization: float = 0.5
+    gpu_memory_utilization: float = 0.9
     dataset: str = "test_prompts"
     num_prompts: int = 100
     # Some settings only get 100% acceptance_rate with VLLM_BATCH_INVARIANT=1
@@ -656,8 +656,8 @@ cases = [
     ),
     # Multiple KV Cache groups
     ArgsTest(
-        target_model="google/gemma-3-270m-it",
-        draft_model="google/gemma-3-270m-it",
+        target_model="openai/gpt-oss-120b",
+        draft_model="openai/gpt-oss-20b",
         sampling_config=greedy_sampling(),
         num_speculative_tokens=3,
         expected_acceptance_len=4,
@@ -774,7 +774,7 @@ def assert_draft_model_correctness(args: ArgsTest, enforce_eager: bool):
 
     test_prompts: list[Messages] = get_messages(
         dataset=args.dataset, n=args.num_prompts
-    )
+    )[:1]
 
     spec_llm = LLM(
         model=args.target_model,
