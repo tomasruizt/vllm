@@ -104,7 +104,6 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     AttentionType,
     CommonAttentionMetadata,
-    KVCacheInfoForSpecDecode,
     MultipleOf,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
@@ -319,6 +318,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
+    cm_by_gid: dict[int, CommonAttentionMetadata]
 
 
 class GPUModelRunner(
@@ -1653,13 +1653,14 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
-    ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
-        """
-        :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
-        """
+    ) -> tuple[
+        PerLayerAttnMetadata,
+        CommonAttentionMetadata | None,
+        dict[int, CommonAttentionMetadata],
+    ]:
         # Attention metadata is not needed for attention free models
         if len(self.kv_cache_config.kv_cache_groups) == 0:
-            return {}, None
+            return {}, None, dict()
 
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
@@ -1757,6 +1758,10 @@ class GPUModelRunner(
             tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
         ] = {}
 
+        # CommonAttentionMetadata objects for each KV cache group.
+        # These are passed to the drafter to support multi-group KV cache in drafters.
+        cm_by_gid: dict[int, CommonAttentionMetadata] = {}
+
         def _build_attn_group_metadata(
             kv_cache_gid: int,
             attn_gid: int,
@@ -1832,9 +1837,11 @@ class GPUModelRunner(
                 kv_cache_group.kv_cache_spec,
                 num_reqs_padded,
             )
-            if kv_cache_gid > 0:
-                cm.block_table_tensor = _get_block_table(kv_cache_gid)
-                cm.slot_mapping = slot_mappings[kv_cache_gid]
+            # if kv_cache_gid > 0:
+            cm.block_table_tensor = _get_block_table(kv_cache_gid)
+            cm.slot_mapping = slot_mappings[kv_cache_gid]
+
+            cm_by_gid[kv_cache_gid] = cm
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
                 if isinstance(self.drafter, EagleProposer):
@@ -1842,19 +1849,6 @@ class GPUModelRunner(
                         spec_decode_common_attn_metadata = cm
                 else:
                     spec_decode_common_attn_metadata = cm
-
-                sd_cm = spec_decode_common_attn_metadata
-                if sd_cm is not None:
-                    # Speculative Decoding requires Information about each KVCache Group
-                    # Below we instantiate this information and pass it over
-                    # CommonAttentionMetadata
-                    kv_cache_info_by_gid: dict[int, KVCacheInfoForSpecDecode] = {}
-                    for gid, kv_cache_group in enumerate(kv_cache_groups):
-                        kv_cache_info_by_gid[gid] = KVCacheInfoForSpecDecode(
-                            block_table=_get_block_table(gid),
-                            slot_mapping=slot_mappings[gid],
-                        )
-                    sd_cm.kv_cache_info_by_gid = kv_cache_info_by_gid
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:
@@ -1893,8 +1887,11 @@ class GPUModelRunner(
             spec_decode_common_attn_metadata = (
                 spec_decode_common_attn_metadata.unpadded(num_tokens, num_reqs)
             )
+            cm_by_gid = {
+                gid: cm.unpadded(num_tokens, num_reqs) for gid, cm in cm_by_gid.items()
+            }
 
-        return attn_metadata, spec_decode_common_attn_metadata
+        return attn_metadata, spec_decode_common_attn_metadata, cm_by_gid
 
     def _compute_cascade_attn_prefix_lens(
         self,
@@ -3449,7 +3446,7 @@ class GPUModelRunner(
                 ubatch_slices=ubatch_slices_padded,
             )
 
-            attn_metadata, spec_decode_common_attn_metadata = (
+            attn_metadata, spec_decode_common_attn_metadata, cm_by_gid = (
                 self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded if pad_attn else None,
@@ -3586,6 +3583,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            cm_by_gid,
         )
         self.kv_connector_output = kv_connector_output
         return None
@@ -3625,6 +3623,7 @@ class GPUModelRunner(
             ec_connector_output,
             cudagraph_stats,
             slot_mappings,
+            cm_by_gid,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -3665,6 +3664,7 @@ class GPUModelRunner(
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
                     slot_mappings,
+                    cm_by_gid,
                 )
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
 
@@ -3913,6 +3913,7 @@ class GPUModelRunner(
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        cm_by_gid: dict[int, CommonAttentionMetadata],
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
@@ -4039,6 +4040,14 @@ class GPUModelRunner(
                         spec_decode_metadata,
                         valid_sampled_tokens_count,
                     )
+
+                    new_cm_by_gid = {}
+                    for gid, cm in cm_by_gid.items():
+                        new_cm_by_gid[gid], _, _ = self.drafter.prepare_inputs_padded(
+                            cm, spec_decode_metadata, valid_sampled_tokens_count
+                        )
+                    cm_by_gid = new_cm_by_gid
+
                     total_num_tokens = common_attn_metadata.num_actual_tokens
                     # When padding the batch, token_indices is just a range
                     target_token_ids = self.input_ids.gpu[:total_num_tokens]
@@ -4070,6 +4079,7 @@ class GPUModelRunner(
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 slot_mappings=slot_mappings,
+                cm_by_gid=cm_by_gid,
             )
 
         return draft_token_ids
@@ -4676,7 +4686,7 @@ class GPUModelRunner(
             self.query_start_loc.copy_to_gpu()
 
             pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
-            attn_metadata, _ = self._build_attention_metadata(
+            attn_metadata, _, _ = self._build_attention_metadata(
                 num_tokens=num_tokens_unpadded,
                 num_reqs=num_reqs_padded,
                 max_query_len=max_query_len,

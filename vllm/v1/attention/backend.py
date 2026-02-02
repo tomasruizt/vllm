@@ -312,9 +312,6 @@ class CommonAttentionMetadata:
     block_table_tensor: torch.Tensor
     slot_mapping: torch.Tensor
 
-    # For multi-group KV cache (e.g. speculative decoding)
-    kv_cache_info_by_gid: dict[int, "KVCacheInfoForSpecDecode"] | None = None
-
     causal: bool = True
 
     # Needed by FastPrefillAttentionBuilder
@@ -403,17 +400,6 @@ class CommonAttentionMetadata:
             max_seq_len=self.max_seq_len,
             block_table_tensor=self.block_table_tensor[:num_actual_reqs],
             slot_mapping=self.slot_mapping[:num_actual_tokens],
-            kv_cache_info_by_gid=(
-                {
-                    gid: KVCacheInfoForSpecDecode(
-                        block_table=info.block_table[:num_actual_reqs],
-                        slot_mapping=info.slot_mapping[:num_actual_tokens],
-                    )
-                    for gid, info in self.kv_cache_info_by_gid.items()
-                }
-                if self.kv_cache_info_by_gid is not None
-                else None
-            ),
             causal=self.causal,
             logits_indices_padded=self.logits_indices_padded,
             num_logits_indices=self.num_logits_indices,
@@ -422,17 +408,6 @@ class CommonAttentionMetadata:
             dcp_local_seq_lens=maybe_slice_reqs(self.dcp_local_seq_lens),
             dcp_local_seq_lens_cpu=maybe_slice_reqs(self.dcp_local_seq_lens_cpu),
         )
-
-
-@dataclass
-class KVCacheInfoForSpecDecode:
-    """Data about a single KV-Cache Group used for spec-decode."""
-
-    block_table: torch.Tensor
-    slot_mapping: torch.Tensor
-
-    def replace(self, **kwargs) -> "KVCacheInfoForSpecDecode":
-        return replace(self, **kwargs)
 
 
 M = TypeVar("M")

@@ -10,7 +10,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.model_loader import get_model
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.backend import KVCacheInfoForSpecDecode
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
     extend_all_queries_by_1,
@@ -89,7 +88,10 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         last_token_indices: torch.Tensor | None,
         cad: CommonAttentionMetadata,
         num_rejected_tokens_gpu: torch.Tensor | None,
-    ) -> tuple[int, torch.Tensor, CommonAttentionMetadata]:
+        cm_by_gid: dict[int, CommonAttentionMetadata],
+    ) -> tuple[
+        int, torch.Tensor, CommonAttentionMetadata, dict[int, CommonAttentionMetadata]
+    ]:
         batch_size = cad.batch_size()
         grid = (batch_size,)
         start_locs = cad.query_start_loc[:-1]
@@ -126,31 +128,28 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         )
 
         # Update slot_mappings across all KV cache groups
-        assert isinstance(cad.kv_cache_info_by_gid, dict)
-        new_kv_cache_info_by_gid: dict[int, KVCacheInfoForSpecDecode] = {}
-        for gid, kv_cache_info in cad.kv_cache_info_by_gid.items():
+        new_cm_by_gid: dict[int, CommonAttentionMetadata] = {}
+        for gid, cm in cm_by_gid.items():
             slot_mapping = compute_new_slot_mapping(
-                cad=cad,
+                cad=cm,
                 new_positions=self.positions[:num_tokens],
                 is_rejected_token_mask=is_rejected_tok,
                 block_size=self._get_metadata_builder(gid).kv_cache_spec.block_size,
                 max_model_len=self.max_model_len,
-                block_table_tensor=kv_cache_info.block_table,
+                block_table_tensor=cm.block_table_tensor,
             )
-            new_kv_cache_info_by_gid[gid] = kv_cache_info.replace(
-                slot_mapping=slot_mapping
-            )
-        new_cad: CommonAttentionMetadata = cad.replace(
-            kv_cache_info_by_gid=new_kv_cache_info_by_gid
-        )
+            new_cm = cm.replace(slot_mapping=slot_mapping)
+            new_cm = extend_all_queries_by_1(new_cm, arange=self.arange)
+            new_cm_by_gid[gid] = new_cm
 
-        new_cad = extend_all_queries_by_1(new_cad, arange=self.arange)
+        # To keep consistency, also update the single CommonAttentionMetadata object
+        new_cad = extend_all_queries_by_1(common_attn_metadata=cad, arange=self.arange)
 
         new_last_token_indices = new_cad.query_start_loc[1:] - 1
         if num_rejected_tokens_gpu is not None:
             new_last_token_indices -= num_rejected_tokens_gpu
 
-        return num_tokens, new_last_token_indices, new_cad
+        return num_tokens, new_last_token_indices, new_cad, new_cm_by_gid
 
     def load_model(self, target_model: Any) -> None:
         """Takes target_model to satisfy the type checker."""
