@@ -616,6 +616,15 @@ def test_mtp_correctness(
         cleanup_dist_env_and_memory()
 
 
+def some_high_acceptance_metrics() -> dict:
+    return {
+        "sampling_config": greedy_sampling(),
+        "num_speculative_tokens": 3,
+        "expected_acceptance_len": 2.8 + 1,
+        "expected_acceptance_rate": 0.90,
+    }
+
+
 @dataclass
 class ArgsTest:
     target_model: str
@@ -664,6 +673,14 @@ cases = [
         expected_acceptance_rate=1,
         # Without batch invariance, acceptance rate is ~86%
         use_batch_invariance=True,
+    ),
+    # GPT-OSS MoE models with different target/draft sizes
+    # Tests MoE layer resolution in speculative decoding.
+    ArgsTest(
+        target_model="openai/gpt-oss-120b",
+        draft_model="openai/gpt-oss-20b",
+        gpu_memory_utilization=0.95,
+        **some_high_acceptance_metrics(),
     ),
 ]
 
@@ -822,15 +839,6 @@ def get_messages(dataset: str, n: int) -> list[Messages]:
         return get_instruct_coder_messages(n=n)
     else:
         raise NotImplementedError(f"Dataset '{dataset}' not implemented")
-
-
-def some_high_acceptance_metrics() -> dict:
-    return {
-        "sampling_config": greedy_sampling(),
-        "num_speculative_tokens": 3,
-        "expected_acceptance_len": 2.8 + 1,
-        "expected_acceptance_rate": 0.90,
-    }
 
 
 def test_merge_toks_kernel():
