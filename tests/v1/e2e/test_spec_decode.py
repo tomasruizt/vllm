@@ -679,7 +679,8 @@ cases = [
     ArgsTest(
         target_model="openai/gpt-oss-120b",
         draft_model="openai/gpt-oss-20b",
-        gpu_memory_utilization=0.95,
+        # Leave some headroom for CUDA graph capture.
+        gpu_memory_utilization=0.85,
         **some_high_acceptance_metrics(),
     ),
 ]
