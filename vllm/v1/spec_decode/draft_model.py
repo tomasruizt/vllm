@@ -10,6 +10,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.model_loader import get_model
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.backend import CommonAttnMetadataByGid
 from vllm.v1.attention.backends.utils import (
     CommonAttentionMetadata,
     extend_all_queries_by_1,
@@ -88,10 +89,8 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         last_token_indices: torch.Tensor | None,
         cad: CommonAttentionMetadata,
         num_rejected_tokens_gpu: torch.Tensor | None,
-        cm_by_gid: dict[int, CommonAttentionMetadata],
-    ) -> tuple[
-        int, torch.Tensor, CommonAttentionMetadata, dict[int, CommonAttentionMetadata]
-    ]:
+        cm_by_gid: CommonAttnMetadataByGid,
+    ) -> tuple[int, torch.Tensor, CommonAttentionMetadata, CommonAttnMetadataByGid]:
         batch_size = cad.batch_size()
         grid = (batch_size,)
         start_locs = cad.query_start_loc[:-1]
@@ -128,7 +127,7 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         )
 
         # Update slot_mappings across all KV cache groups
-        new_cm_by_gid: dict[int, CommonAttentionMetadata] = {}
+        new_cm_by_gid: CommonAttnMetadataByGid = {}
         for gid, cm in cm_by_gid.items():
             slot_mapping = compute_new_slot_mapping(
                 cad=cm,

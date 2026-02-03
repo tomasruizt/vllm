@@ -104,6 +104,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     AttentionType,
     CommonAttentionMetadata,
+    CommonAttnMetadataByGid,
     MultipleOf,
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
@@ -317,7 +318,7 @@ class ExecuteModelState(NamedTuple):
     ec_connector_output: ECConnectorOutput | None
     cudagraph_stats: CUDAGraphStat | None
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None
-    cm_by_gid: dict[int, CommonAttentionMetadata]
+    cm_by_gid: CommonAttnMetadataByGid
 
 
 class GPUModelRunner(
@@ -1654,7 +1655,7 @@ class GPUModelRunner(
         slot_mappings: dict[int, torch.Tensor] | None = None,
     ) -> tuple[
         PerLayerAttnMetadata,
-        dict[int, CommonAttentionMetadata],
+        CommonAttnMetadataByGid,
     ]:
         # Attention metadata is not needed for attention free models
         if len(self.kv_cache_config.kv_cache_groups) == 0:
@@ -1758,7 +1759,7 @@ class GPUModelRunner(
 
         # CommonAttentionMetadata objects for each KV cache group.
         # These are passed to the drafter to support multi-group KV cache in drafters.
-        cm_by_gid: dict[int, CommonAttentionMetadata] = {}
+        cm_by_gid: CommonAttnMetadataByGid = {}
 
         def _build_attn_group_metadata(
             kv_cache_gid: int,
@@ -3895,7 +3896,7 @@ class GPUModelRunner(
         aux_hidden_states: list[torch.Tensor] | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
-        cm_by_gid: dict[int, CommonAttentionMetadata],
+        cm_by_gid: CommonAttnMetadataByGid,
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
