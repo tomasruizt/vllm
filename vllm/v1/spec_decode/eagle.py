@@ -234,6 +234,17 @@ class SpecDecodeBaseProposer:
     def layer_names_to_kv_cache_gid(self) -> dict[str, int]:
         return layer_names_to_kv_cache_group_id(self.runner.attn_groups)
 
+    def pick_first_layer_common_attn_metadata(
+        self, cm_by_gid: dict[int, CommonAttentionMetadata]
+    ) -> CommonAttentionMetadata:
+        """Pick the CommonAttentionMetadata for the drafter's first attention layer.
+
+        The drafter may have attention layers in different KV cache groups.
+        This method picks the CAM corresponding to the first attention layer.
+        """
+        gid = self.layer_names_to_kv_cache_gid[self.attn_layer_names[0]]
+        return cm_by_gid[gid]
+
     def _get_positions(self, num_tokens: int):
         if self.uses_mrope:
             return self.mrope_positions[:, :num_tokens]
@@ -329,7 +340,6 @@ class SpecDecodeBaseProposer:
         # [batch_size]
         next_token_ids: torch.Tensor,
         last_token_indices: torch.Tensor | None,
-        common_attn_metadata: CommonAttentionMetadata,
         sampling_metadata: SamplingMetadata,
         # CommonAttentionMetadata for each KV cache group ID.
         cm_by_gid: dict[int, CommonAttentionMetadata],
@@ -339,6 +349,7 @@ class SpecDecodeBaseProposer:
         | list[dict[str, torch.Tensor]]
         | None = None,
     ) -> torch.Tensor:
+        common_attn_metadata = self.pick_first_layer_common_attn_metadata(cm_by_gid)
         batch_size = common_attn_metadata.batch_size()
 
         if self.method == "eagle3":
@@ -744,7 +755,7 @@ class SpecDecodeBaseProposer:
 
     def prepare_next_token_ids_padded(
         self,
-        common_attn_metadata: CommonAttentionMetadata,
+        cm_by_gid: dict[int, CommonAttentionMetadata],
         sampled_token_ids: torch.Tensor,
         requests: dict[str, CachedRequestState],
         gpu_input_batch: InputBatch,
@@ -757,6 +768,7 @@ class SpecDecodeBaseProposer:
         is not sampled and comes from `request.get_token_id()` instead. This is denoted
         the "backup" token id. It also counts rejected tokens via `sampled_token_ids`.
         """
+        common_attn_metadata = self.pick_first_layer_common_attn_metadata(cm_by_gid)
         # Precompute get_token_id for when there is no valid next token
         num_reqs = gpu_input_batch.num_reqs
         self.backup_next_token_ids.np[:num_reqs] = np.array(
@@ -802,10 +814,10 @@ class SpecDecodeBaseProposer:
 
     def prepare_inputs_padded(
         self,
-        common_attn_metadata: CommonAttentionMetadata,
+        cm_by_gid: dict[int, CommonAttentionMetadata],
         spec_decode_metadata: SpecDecodeMetadata,
         valid_sampled_tokens_count: torch.Tensor,
-    ) -> tuple[CommonAttentionMetadata, torch.Tensor, torch.Tensor]:
+    ) -> tuple[dict[int, CommonAttentionMetadata], torch.Tensor, torch.Tensor]:
         """
         This function is used to prepare the inputs for speculative decoding
         It updates the common_attn_metadata for speculative decoding,
@@ -814,6 +826,9 @@ class SpecDecodeBaseProposer:
         used as padding and filtered out later by `token_indices_to_sample`.
         No blocking CPU operations should be introduced in this function.
         """
+        # Pick the CAM for the drafter's first attention layer as the base
+        common_attn_metadata = self.pick_first_layer_common_attn_metadata(cm_by_gid)
+
         num_reqs = common_attn_metadata.num_reqs
         device = valid_sampled_tokens_count.device
 
@@ -838,8 +853,11 @@ class SpecDecodeBaseProposer:
         new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
         total_num_tokens = query_start_loc_cpu[-1].item()
+        max_query_len = new_query_len_per_req.max().item()
+        max_seq_len = common_attn_metadata.seq_lens_cpu.max().item()
 
-        spec_common_attn_metadata = CommonAttentionMetadata(
+        # First create the new base CAM with transformed shared fields
+        new_cam = CommonAttentionMetadata(
             query_start_loc=common_attn_metadata.query_start_loc,
             seq_lens=common_attn_metadata.seq_lens,
             query_start_loc_cpu=query_start_loc_cpu,
@@ -847,16 +865,25 @@ class SpecDecodeBaseProposer:
             _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=total_num_tokens,
-            max_query_len=new_query_len_per_req.max().item(),
-            max_seq_len=common_attn_metadata.seq_lens_cpu.max().item(),
+            max_query_len=max_query_len,
+            max_seq_len=max_seq_len,
             block_table_tensor=common_attn_metadata.block_table_tensor,
             slot_mapping=common_attn_metadata.slot_mapping,
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
 
+        # Then create new CAMs for all groups, preserving each group's
+        # block_table_tensor and slot_mapping
+        new_cm_by_gid: dict[int, CommonAttentionMetadata] = {}
+        for gid, cm in cm_by_gid.items():
+            new_cm_by_gid[gid] = new_cam.replace(
+                block_table_tensor=cm.block_table_tensor,
+                slot_mapping=cm.slot_mapping,
+            )
+
         return (
-            spec_common_attn_metadata,
+            new_cm_by_gid,
             token_indices_to_sample,
             num_rejected_tokens_gpu,
         )
@@ -1038,16 +1065,19 @@ class SpecDecodeBaseProposer:
 
     def prepare_inputs(
         self,
-        common_attn_metadata: CommonAttentionMetadata,
+        cm_by_gid: dict[int, CommonAttentionMetadata],
         sampled_token_ids: list[list[int]],
         num_draft_tokens: list[int],
-    ) -> tuple[CommonAttentionMetadata, torch.Tensor]:
+    ) -> tuple[dict[int, CommonAttentionMetadata], torch.Tensor]:
         """
         This function is used to prepare the inputs for speculative decoding.
         It updates to the common_attn_metadata to account for the rejected
         tokens (and newly sampled tokens). It also returns the token indices
         of the tokens that should be fed to the speculator.
         """
+        # Pick the CAM for the drafter's first attention layer as the base
+        common_attn_metadata = self.pick_first_layer_common_attn_metadata(cm_by_gid)
+
         # E.g.
         #  common_attn_metadata.query_start_loc{_cpu}:
         #       [0, q1, q1 + q2, q1 + q2 + q3]
@@ -1120,7 +1150,8 @@ class SpecDecodeBaseProposer:
         token_indices_np = token_offests + old_query_start_locs_expanded
         token_indices = torch.from_numpy(token_indices_np).to(device, non_blocking=True)
 
-        spec_common_attn_metadata = CommonAttentionMetadata(
+        # First create the new base CAM with transformed shared fields
+        new_cam = CommonAttentionMetadata(
             query_start_loc=new_query_start_loc_cpu.to(device, non_blocking=True),
             seq_lens=new_seq_lens_cpu.to(device, non_blocking=True),
             query_start_loc_cpu=new_query_start_loc_cpu,
@@ -1136,7 +1167,16 @@ class SpecDecodeBaseProposer:
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
 
-        return spec_common_attn_metadata, token_indices
+        # Then create new CAMs for all groups, preserving each group's
+        # block_table_tensor and slot_mapping
+        new_cm_by_gid: dict[int, CommonAttentionMetadata] = {}
+        for gid, cm in cm_by_gid.items():
+            new_cm_by_gid[gid] = new_cam.replace(
+                block_table_tensor=cm.block_table_tensor,
+                slot_mapping=cm.slot_mapping,
+            )
+
+        return new_cm_by_gid, token_indices
 
     def get_model_name(self, model: nn.Module) -> str:
         if hasattr(model, "module"):  # multi-GPU
