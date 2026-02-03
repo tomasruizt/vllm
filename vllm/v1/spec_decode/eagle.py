@@ -350,9 +350,6 @@ class SpecDecodeBaseProposer:
         | list[dict[str, torch.Tensor]]
         | None = None,
     ) -> torch.Tensor:
-        common_attn_metadata = self.pick_first_layer_common_attn_metadata(cm_by_gid)
-        batch_size = common_attn_metadata.batch_size()
-
         if self.method == "eagle3":
             assert isinstance(self.model, Eagle3LlamaForCausalLM)
             target_hidden_states = self.model.combine_hidden_states(
@@ -363,17 +360,16 @@ class SpecDecodeBaseProposer:
         assert self.runner is not None
 
         # Per-group block tables, block sizes, slot mappings (from common_attn_metadata)
-        num_tokens, last_token_indices, common_attn_metadata, cm_by_gid = (
-            self.set_inputs_first_pass(
-                target_token_ids=target_token_ids,
-                next_token_ids=next_token_ids,
-                target_positions=target_positions,
-                last_token_indices=last_token_indices,
-                cad=common_attn_metadata,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                cm_by_gid=cm_by_gid,
-            )
+        num_tokens, last_token_indices, cm_by_gid = self.set_inputs_first_pass(
+            target_token_ids=target_token_ids,
+            next_token_ids=next_token_ids,
+            target_positions=target_positions,
+            last_token_indices=last_token_indices,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            cm_by_gid=cm_by_gid,
         )
+        common_attn_metadata = self.pick_first_layer_common_attn_metadata(cm_by_gid)
+        batch_size = common_attn_metadata.batch_size()
 
         # Build attention metadata for each KV cache group
         per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
@@ -694,10 +690,10 @@ class SpecDecodeBaseProposer:
         next_token_ids: torch.Tensor,
         target_positions: torch.Tensor,
         last_token_indices: torch.Tensor | None,
-        cad: CommonAttentionMetadata,
         num_rejected_tokens_gpu: torch.Tensor | None,
         cm_by_gid: CommonAttnMetadataByGid,
-    ) -> tuple[int, torch.Tensor, CommonAttentionMetadata, CommonAttnMetadataByGid]:
+    ) -> tuple[int, torch.Tensor, CommonAttnMetadataByGid]:
+        cad = self.pick_first_layer_common_attn_metadata(cm_by_gid)
         if last_token_indices is None:
             last_token_indices = cad.query_start_loc[1:] - 1
 
@@ -714,7 +710,7 @@ class SpecDecodeBaseProposer:
             target_positions = target_positions[0]
         self._set_positions(num_tokens, target_positions)
 
-        return num_tokens, last_token_indices, cad, cm_by_gid
+        return num_tokens, last_token_indices, cm_by_gid
 
     def model_returns_tuple(self) -> bool:
         return self.method not in ("mtp", "draft_model")

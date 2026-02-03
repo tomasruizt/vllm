@@ -87,10 +87,10 @@ class DraftModelProposer(SpecDecodeBaseProposer):
         next_token_ids: torch.Tensor,
         target_positions: torch.Tensor,
         last_token_indices: torch.Tensor | None,
-        cad: CommonAttentionMetadata,
         num_rejected_tokens_gpu: torch.Tensor | None,
         cm_by_gid: CommonAttnMetadataByGid,
-    ) -> tuple[int, torch.Tensor, CommonAttentionMetadata, CommonAttnMetadataByGid]:
+    ) -> tuple[int, torch.Tensor, CommonAttnMetadataByGid]:
+        cad = self.pick_first_layer_common_attn_metadata(cm_by_gid)
         batch_size = cad.batch_size()
         grid = (batch_size,)
         start_locs = cad.query_start_loc[:-1]
@@ -141,14 +141,13 @@ class DraftModelProposer(SpecDecodeBaseProposer):
             new_cm = extend_all_queries_by_1(new_cm, arange=self.arange)
             new_cm_by_gid[gid] = new_cm
 
-        # To keep consistency, also update the single CommonAttentionMetadata object
-        new_cad = extend_all_queries_by_1(common_attn_metadata=cad, arange=self.arange)
-
+        # Pick the updated CAM to compute new_last_token_indices
+        new_cad = self.pick_first_layer_common_attn_metadata(new_cm_by_gid)
         new_last_token_indices = new_cad.query_start_loc[1:] - 1
         if num_rejected_tokens_gpu is not None:
             new_last_token_indices -= num_rejected_tokens_gpu
 
-        return num_tokens, new_last_token_indices, new_cad, new_cm_by_gid
+        return num_tokens, new_last_token_indices, new_cm_by_gid
 
     def load_model(self, target_model: Any) -> None:
         """Takes target_model to satisfy the type checker."""
