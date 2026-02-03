@@ -599,17 +599,6 @@ def unified_attention(
 ) -> torch.Tensor:
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
 
-    # DEBUG: Log KV cache read info for draft model layers during inference
-    if "draft_model" in layer_name and kv_cache.numel() > 0 and query.shape[0] < 500:
-        count = _attention_debug_counter.get(layer_name, 0)
-        if count < 3:  # Log first 3 inference calls per layer
-            _attention_debug_counter[layer_name] = count + 1
-            import logging
-            attn_logger = logging.getLogger(__name__)
-            kv_cache_ptr = kv_cache.data_ptr()
-            attn_logger.info("DEBUG ATTENTION INFER call#%d: layer=%s, query_shape=%s, kv_cache_shape=%s, kv_cache_ptr=%d",
-                       count + 1, layer_name, query.shape, kv_cache.shape, kv_cache_ptr)
-
     output = self.impl.forward(self, query, key, value, kv_cache, attn_metadata)
 
     return output
@@ -631,9 +620,6 @@ direct_register_custom_op(
 )
 
 
-_kv_cache_update_debug_counter = {}
-_attention_debug_counter = {}
-
 def unified_kv_cache_update(
     key: torch.Tensor,
     value: torch.Tensor,
@@ -652,24 +638,6 @@ def unified_kv_cache_update(
         f"Expected slot_mapping to be a dict, got {type(slot_mapping)}. "
     )
     layer_slot_mapping = slot_mapping.get(layer_name)
-
-    # DEBUG: Log KV cache update info for draft model layers
-    # Only log inference calls (key_shape < 1024) not warmup calls (key_shape == 16384 or 1024)
-    if "draft_model" in layer_name and kv_cache.numel() > 0 and key.shape[0] < 500:
-        count = _kv_cache_update_debug_counter.get(layer_name, 0)
-        if count < 3:  # Log first 3 inference calls per layer
-            _kv_cache_update_debug_counter[layer_name] = count + 1
-            import logging
-            logger = logging.getLogger(__name__)
-            has_slot_mapping = layer_slot_mapping is not None
-            kv_cache_shape = kv_cache.shape
-            slot_mapping_info = f"shape={layer_slot_mapping.shape}, first5={layer_slot_mapping[:5].tolist()}" if has_slot_mapping else "None"
-            # Log kv_cache data pointer for verification
-            kv_cache_ptr = kv_cache.data_ptr()
-            # Log key/value statistics
-            key_stats = f"mean={key.float().mean().item():.4f}, std={key.float().std().item():.4f}, min={key.float().min().item():.4f}, max={key.float().max().item():.4f}"
-            logger.info("DEBUG KV_UPDATE INFER call#%d: layer=%s, has_slot_mapping=%s, slot_mapping=%s, kv_cache_shape=%s, key_shape=%s, kv_cache_ptr=%d, key_stats=[%s]",
-                       count + 1, layer_name, has_slot_mapping, slot_mapping_info, kv_cache_shape, key.shape, kv_cache_ptr, key_stats)
 
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
@@ -719,32 +687,6 @@ def unified_attention_with_output(
     del kv_cache_dummy_dep
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
 
-    # DEBUG: Log KV cache read info for draft model layers during inference
-    if "draft_model" in layer_name and kv_cache.numel() > 0 and query.shape[0] < 500:
-        count = _attention_debug_counter.get(layer_name, 0)
-        if count < 3:  # Log first 3 inference calls per layer
-            _attention_debug_counter[layer_name] = count + 1
-            import logging
-            attn_logger = logging.getLogger(__name__)
-            kv_cache_ptr = kv_cache.data_ptr()
-            # Log block_table from attn_metadata
-            block_table_info = "N/A"
-            seq_info = "N/A"
-            if attn_metadata is not None:
-                if hasattr(attn_metadata, 'block_table') and attn_metadata.block_table is not None:
-                    bt = attn_metadata.block_table
-                    block_table_info = f"shape={bt.shape}, first5={bt[0, :5].tolist()}"
-                # Log seq_lens and max_seq_len
-                if hasattr(attn_metadata, 'seq_lens'):
-                    seq_lens = attn_metadata.seq_lens
-                    max_seq = getattr(attn_metadata, 'max_seq_len', 'N/A')
-                    max_q = getattr(attn_metadata, 'max_query_len', 'N/A')
-                    seq_info = f"seq_lens={seq_lens[:5].tolist() if hasattr(seq_lens, '__getitem__') else seq_lens}, max_seq_len={max_seq}, max_query_len={max_q}"
-            # Log query stats
-            query_stats = f"mean={query.float().mean().item():.4f}, std={query.float().std().item():.4f}"
-            attn_logger.info("DEBUG ATTENTION_OUT INFER call#%d: layer=%s, query_shape=%s, kv_cache_shape=%s, kv_cache_ptr=%d, block_table=%s, %s, query_stats=[%s]",
-                       count + 1, layer_name, query.shape, kv_cache.shape, kv_cache_ptr, block_table_info, seq_info, query_stats)
-
     self.impl.forward(
         self,
         query,
@@ -756,17 +698,6 @@ def unified_attention_with_output(
         output_scale=output_scale,
         output_block_scale=output_block_scale,
     )
-
-    # DEBUG: Log attention output stats for draft model layers
-    if "draft_model" in layer_name and output.numel() > 0 and query.shape[0] < 500:
-        count = _attention_debug_counter.get(layer_name + "_out", 0)
-        if count < 3:
-            _attention_debug_counter[layer_name + "_out"] = count + 1
-            import logging
-            out_logger = logging.getLogger(__name__)
-            out_stats = f"mean={output.float().mean().item():.4f}, std={output.float().std().item():.4f}, min={output.float().min().item():.4f}, max={output.float().max().item():.4f}"
-            out_logger.info("DEBUG ATTN_OUTPUT call#%d: layer=%s, output_shape=%s, output_stats=[%s]",
-                       count + 1, layer_name, output.shape, out_stats)
 
 
 def unified_attention_with_output_fake(

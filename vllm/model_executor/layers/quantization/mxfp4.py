@@ -759,6 +759,11 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             else:
                 num_warps = 8
 
+            # DEBUG: Log num_warps used for swizzle
+            layer_name = getattr(layer, 'layer_name', 'unknown')
+            logger.info("DEBUG MXFP4 SWIZZLE: layer=%s, is_batched_moe=%s, num_warps=%d",
+                       layer_name, is_batched_moe, num_warps)
+
             w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
                 layer.w13_weight, layer.w13_weight_scale, num_warps
             )
@@ -766,11 +771,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight, layer.w2_weight_scale, num_warps
             )
 
+            # EXPERIMENTAL: Try enforce_bitwise_invariance=True to fix spec decode divergence
+            import os
+            enforce_bitwise = os.environ.get("VLLM_ENFORCE_BITWISE_INVARIANCE", "0") == "1"
             self.w13_precision_config = PrecisionConfig(
-                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex),
+                enforce_bitwise_invariance=enforce_bitwise
             )
             self.w2_precision_config = PrecisionConfig(
-                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
+                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex),
+                enforce_bitwise_invariance=enforce_bitwise
             )
 
             self.w13_weight = w13_weight
@@ -1083,41 +1093,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from vllm.model_executor.layers.fused_moe.gpt_oss_triton_kernels_moe import (  # noqa: E501
                 triton_kernel_moe_forward,
             )
-
-            # DEBUG: Log weights and quant_config for draft model layer 0
-            layer_name = getattr(layer, 'layer_name', 'unknown')
-            # Unconditional log to check if triton path is reached
-            logger.info("DEBUG TRITON PATH: layer=%s, x_shape=%s", layer_name, x.shape)
-            if "draft_model" in layer_name and ".0." in layer_name and x.shape[0] < 100:
-                # Get weight fingerprints
-                try:
-                    w1_data = layer.w13_weight.data if hasattr(layer.w13_weight, 'data') else None
-                    w2_data = layer.w2_weight.data if hasattr(layer.w2_weight, 'data') else None
-
-                    if w1_data is not None and isinstance(w1_data, torch.Tensor):
-                        logger.info("DEBUG TRITON W1_DATA: layer=%s, shape=%s, sum=%.4f, mean=%.6f, first_10=%s",
-                                          layer_name, w1_data.shape, w1_data.float().sum().item(),
-                                          w1_data.float().mean().item(), w1_data.flatten()[:10].float().tolist())
-                    else:
-                        logger.info("DEBUG TRITON W1_DATA_TYPE: layer=%s, w13_type=%s, has_data=%s",
-                                          layer_name, type(layer.w13_weight).__name__, hasattr(layer.w13_weight, 'data'))
-
-                    # Check quant_config precision
-                    if self.moe_quant_config is not None:
-                        w1p = self.moe_quant_config.w1_precision
-                        logger.info("DEBUG TRITON QUANT_CONFIG: layer=%s, w1p_type=%s, w1p_id=%s",
-                                   layer_name, type(w1p).__name__ if w1p else 'None', id(w1p) if w1p else 'None')
-                        if w1p is not None and hasattr(w1p, 'weight_scale'):
-                            ws = w1p.weight_scale
-                            logger.info("DEBUG TRITON WS_TYPE: layer=%s, ws_type=%s, has_data=%s",
-                                       layer_name, type(ws).__name__, hasattr(ws, 'data'))
-                            if hasattr(ws, 'data') and isinstance(ws.data, torch.Tensor):
-                                ws_t = ws.data
-                                logger.info("DEBUG TRITON W1_SCALE: layer=%s, shape=%s, sum=%.4f, mean=%.6f, first_10=%s",
-                                                  layer_name, ws_t.shape, ws_t.float().sum().item(),
-                                                  ws_t.float().mean().item(), ws_t.flatten()[:10].float().tolist())
-                except Exception as e:
-                    logger.info("DEBUG TRITON ERROR: layer=%s, error=%s", layer_name, str(e))
 
             return triton_kernel_moe_forward(
                 hidden_states=x,

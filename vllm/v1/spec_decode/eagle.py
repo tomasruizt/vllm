@@ -364,31 +364,6 @@ class SpecDecodeBaseProposer:
         )
         assert common_attn_metadata.kv_cache_info_by_gid is not None
 
-        # DEBUG: Log KV cache group info (only once)
-        if not hasattr(self, '_debug_logged'):
-            self._debug_logged = True
-            logger.info("DEBUG: kv_cache_info_by_gid keys: %s", list(common_attn_metadata.kv_cache_info_by_gid.keys()))
-            logger.info("DEBUG: Total draft attn_layer_names: %d", len(self.attn_layer_names))
-
-            # Check which gids are used by draft model layers
-            draft_gids = set()
-            for layer_name in self.attn_layer_names:
-                gid = self.layer_names_to_kv_cache_gid[layer_name]
-                draft_gids.add(gid)
-            logger.info("DEBUG: Draft model layers use KV cache groups: %s", sorted(draft_gids))
-
-            logger.info("DEBUG: num attn_groups: %d", len(self.runner.attn_groups))
-            for i, group_list in enumerate(self.runner.attn_groups):
-                logger.info("DEBUG:   attn_groups[%d] has %d groups, first layer names: %s",
-                           i, len(group_list), group_list[0].layer_names[:2] if group_list else "N/A")
-
-            # Log slot_mapping info for each gid
-            for gid, kv_cache_info in common_attn_metadata.kv_cache_info_by_gid.items():
-                sm = kv_cache_info.slot_mapping
-                bt = kv_cache_info.block_table
-                logger.info("DEBUG: gid=%d: slot_mapping shape=%s, first 5 values=%s, block_table shape=%s",
-                           gid, sm.shape, sm[:5].tolist() if len(sm) > 0 else "[]", bt.shape)
-
         # Build attention metadata for each KV cache group
         per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
 
@@ -405,26 +380,6 @@ class SpecDecodeBaseProposer:
         for layer_name in self.attn_layer_names:
             gid = self.layer_names_to_kv_cache_gid[layer_name]
             per_layer_attn_metadata[layer_name] = attn_metadata_by_gid[gid]
-
-        # DEBUG: Log attention metadata info
-        if not hasattr(self, '_debug_logged_attn_metadata'):
-            self._debug_logged_attn_metadata = True
-            logger.info("DEBUG ATTN_METADATA: attn_metadata_by_gid keys: %s", list(attn_metadata_by_gid.keys()))
-            for gid, attn_meta in attn_metadata_by_gid.items():
-                # Get first few block_table values
-                bt_values = attn_meta.block_table[0, :5].tolist() if attn_meta.block_table.numel() > 0 else []
-                logger.info("DEBUG ATTN_METADATA: gid=%d, slot_mapping first 5=%s, block_table first 5=%s",
-                           gid,
-                           attn_meta.slot_mapping[:min(5, len(attn_meta.slot_mapping))].tolist(),
-                           bt_values)
-                # Check critical prefill/decode fields
-                max_query_len = getattr(attn_meta, 'max_query_len', 'N/A')
-                num_actual_tokens = getattr(attn_meta, 'num_actual_tokens', 'N/A')
-                max_seq_len = getattr(attn_meta, 'max_seq_len', 'N/A')
-                seq_lens = getattr(attn_meta, 'seq_lens', None)
-                seq_lens_str = seq_lens[:5].tolist() if seq_lens is not None else 'N/A'
-                logger.info("DEBUG ATTN_METADATA: gid=%d, max_query_len=%s, num_actual_tokens=%s, max_seq_len=%s, seq_lens[:5]=%s",
-                           gid, max_query_len, num_actual_tokens, max_seq_len, seq_lens_str)
 
         # FIXME: support hybrid kv for draft model (remove separate indexer)
         if self.draft_indexer_metadata_builder:
@@ -485,17 +440,6 @@ class SpecDecodeBaseProposer:
             kv_cache_info_by_gid=common_attn_metadata.kv_cache_info_by_gid,
         )
 
-        # DEBUG: Log slot_mapping info
-        if not hasattr(self, '_debug_logged_slot_mapping'):
-            self._debug_logged_slot_mapping = True
-            logger.info("DEBUG SLOT_MAPPING: keys in slot_mapping_dict: %s", list(slot_mapping_dict.keys())[:5])
-            logger.info("DEBUG SLOT_MAPPING: num_input_tokens=%d", num_input_tokens)
-            # Show first few values for each layer
-            for layer_name in list(slot_mapping_dict.keys())[:2]:
-                sm = slot_mapping_dict[layer_name]
-                logger.info("DEBUG SLOT_MAPPING: layer=%s, shape=%s, first 5 values=%s",
-                           layer_name, sm.shape, sm[:min(5, len(sm))].tolist())
-
         with set_forward_context(
             per_layer_attn_metadata,
             self.vllm_config,
@@ -513,25 +457,6 @@ class SpecDecodeBaseProposer:
 
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states)
-
-        # DEBUG: Log draft model output on first real call (not warmup)
-        if not hasattr(self, '_debug_logged_propose'):
-            if self.input_ids[0].item() != 0:  # Only log if we have real input
-                self._debug_logged_propose = True
-                logger.info("DEBUG PROPOSE: input_ids[:5]=%s", self.input_ids[:min(5, num_tokens)].tolist())
-                logger.info("DEBUG PROPOSE: positions[:5]=%s", self.positions[:min(5, num_tokens)].tolist())
-                logger.info("DEBUG PROPOSE: last_token_indices=%s", last_token_indices.tolist())
-                logger.info("DEBUG PROPOSE: logits shape=%s", logits.shape)
-                logger.info("DEBUG PROPOSE: first draft token (argmax)=%s", logits.argmax(dim=-1).tolist())
-                # Log top 5 logit values for first position
-                top5_values, top5_indices = logits[0].topk(5)
-                logger.info("DEBUG PROPOSE: top5 logit values for pos 0: values=%s, tokens=%s",
-                           top5_values.tolist(), top5_indices.tolist())
-                # Log hidden states stats
-                logger.info("DEBUG PROPOSE: sample_hidden_states shape=%s, mean=%.4f, std=%.4f, min=%.4f, max=%.4f",
-                           sample_hidden_states.shape, sample_hidden_states.mean().item(),
-                           sample_hidden_states.std().item(), sample_hidden_states.min().item(),
-                           sample_hidden_states.max().item())
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1:

@@ -196,6 +196,7 @@ def triton_kernel_fused_experts(
         gammas=None if apply_router_weight_on_input else gammas,
         y=output_tensor,
     )
+
     output_tensor = output_tensor.view(M, K)
     return output_tensor
 

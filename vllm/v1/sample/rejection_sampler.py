@@ -150,18 +150,6 @@ class RejectionSampler(nn.Module):
             sampling_metadata,
         )
 
-        # DEBUG: Log draft vs target tokens - only when draft tokens are not all zeros
-        if not hasattr(self, '_debug_logged_rejection'):
-            if metadata.draft_token_ids.sum().item() != 0:  # Only log if we have real draft tokens
-                self._debug_logged_rejection = True
-                target_argmax = target_probs.argmax(dim=-1)
-                logger.info("DEBUG REJECT: draft_token_ids=%s", metadata.draft_token_ids.tolist())
-                logger.info("DEBUG REJECT: target_argmax=%s", target_argmax.tolist())
-                logger.info("DEBUG REJECT: num_draft_tokens=%s", metadata.num_draft_tokens)
-                # Check how many match
-                matches = (metadata.draft_token_ids == target_argmax).sum().item()
-                logger.info("DEBUG REJECT: num_matches=%d out of %d", matches, len(metadata.draft_token_ids))
-
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
             logprobs_tensors = self._get_logprobs_tensors(

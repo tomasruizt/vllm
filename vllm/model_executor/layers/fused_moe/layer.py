@@ -1565,6 +1565,13 @@ class FusedMoE(CustomOp):
 
         def encode_layer_name() -> str:
             # Can be unavailable or None in unittests
+            # IMPORTANT: For draft model layers in speculative decoding, we must
+            # return the actual layer name directly. The "from_forward_context"
+            # mechanism relies on a counter that doesn't account for multiple
+            # models sharing the same vllm_config. Draft model layers would
+            # incorrectly resolve to target model layers if we use the counter.
+            if "draft_model" in self.layer_name:
+                return self.layer_name
             if (
                 is_forward_context_available()
                 and get_forward_context().all_moe_layers is not None

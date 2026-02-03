@@ -139,8 +139,6 @@ class OAIAttention(nn.Module):
         return output
 
 
-_mlp_block_debug_counter = {}
-
 class MLPBlock(torch.nn.Module):
     def __init__(
         self,
@@ -178,16 +176,8 @@ class MLPBlock(torch.nn.Module):
             activation="swigluoai",
             is_sequence_parallel=self.is_sequence_parallel,
         )
-        # DEBUG: Log quant_config for draft model
-        from vllm.logger import init_logger
-        logger = init_logger(__name__)
-        if "draft_model" in prefix and layer_idx == 0:
-            logger.info("DEBUG MLP INIT: prefix=%s, quant_config=%s", prefix, quant_config)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        from vllm.logger import init_logger
-        logger = init_logger(__name__)
-
         num_tokens = x.shape[0]
         if self.is_sequence_parallel:
             x = sequence_parallel_chunk(x)
@@ -199,84 +189,13 @@ class MLPBlock(torch.nn.Module):
         else:
             g = self.router(x)
 
-        # DEBUG: Log router output for draft model layer 0
-        if "draft_model" in self.prefix and self.layer_idx == 0 and x.shape[0] < 100:
-            count = _mlp_block_debug_counter.get(f"{self.prefix}_router", 0)
-            if count < 2:
-                _mlp_block_debug_counter[f"{self.prefix}_router"] = count + 1
-                logger.info("DEBUG MLP ROUTER: prefix=%s, router_logits shape=%s, mean=%.4f, std=%.4f, topk_indices=%s",
-                           self.prefix, g.shape, g.float().mean().item(), g.float().std().item(),
-                           g[0].topk(self.experts_per_token).indices.tolist())
-                # Log weight fingerprints
-                w13 = self.experts.w13_weight
-                w2 = self.experts.w2_weight
-                # Handle triton_kernels.Tensor which doesn't have .float()
-                try:
-                    w13_t = w13 if isinstance(w13, torch.Tensor) else w13.pt_tensor
-                    w2_t = w2 if isinstance(w2, torch.Tensor) else w2.pt_tensor
-                    logger.info("DEBUG MLP WEIGHTS: prefix=%s, w13_shape=%s, w13_sum=%.4f, w2_shape=%s, w2_sum=%.4f",
-                               self.prefix, w13.shape, w13_t.float().sum().item(), w2.shape, w2_t.float().sum().item())
-                except Exception as e:
-                    logger.info("DEBUG MLP WEIGHTS: prefix=%s, w13_shape=%s, w2_shape=%s, w13_type=%s, error=%s",
-                               self.prefix, w13.shape, w2.shape, type(w13).__name__, str(e))
-                # Log quant_method details
-                qm = self.experts.quant_method
-                logger.info("DEBUG MLP QUANT_METHOD: prefix=%s, type=%s, backend=%s, id=%s",
-                           self.prefix, type(qm).__name__,
-                           getattr(qm, 'mxfp4_backend', 'N/A'),
-                           id(qm))
-                # Check moe_quant_config
-                if hasattr(qm, 'moe_quant_config') and qm.moe_quant_config is not None:
-                    mqc = qm.moe_quant_config
-                    logger.info("DEBUG MLP MOE_QUANT_CONFIG: prefix=%s, id=%s, w1_prec_id=%s, w2_prec_id=%s",
-                               self.prefix, id(mqc),
-                               id(mqc.w1_precision) if mqc.w1_precision else 'None',
-                               id(mqc.w2_precision) if mqc.w2_precision else 'None')
-                # Check precision configs for triton
-                if hasattr(qm, 'w13_precision_config'):
-                    pc = qm.w13_precision_config
-                    ws = pc.weight_scale if hasattr(pc, 'weight_scale') else 'N/A'
-                    logger.info("DEBUG MLP PRECISION_CONFIG: prefix=%s, w13_pc_id=%s, ws_type=%s, ws_shape=%s",
-                               self.prefix, id(pc), type(ws).__name__, getattr(ws, 'shape', 'N/A'))
-                    # Log weight scale fingerprint - handle triton_kernels.Tensor
-                    try:
-                        # Check available attributes
-                        logger.info("DEBUG MLP WS_ATTRS: prefix=%s, attrs=%s", self.prefix, [a for a in dir(ws) if not a.startswith('_')][:20])
-                        if hasattr(ws, 'data'):
-                            ws_pt = ws.data
-                        elif hasattr(ws, 'pt_tensor'):
-                            ws_pt = ws.pt_tensor
-                        elif isinstance(ws, torch.Tensor):
-                            ws_pt = ws
-                        else:
-                            ws_pt = None
-                            logger.info("DEBUG MLP WEIGHT_SCALE_NONE: prefix=%s, ws_type=%s", self.prefix, type(ws).__name__)
-                        if ws_pt is not None and isinstance(ws_pt, torch.Tensor):
-                            logger.info("DEBUG MLP WEIGHT_SCALE: prefix=%s, ws_sum=%.4f, ws_mean=%.6f, ws_std=%.6f, ws_max=%.4f, first_10=%s",
-                                       self.prefix, ws_pt.float().sum().item(), ws_pt.float().mean().item(), ws_pt.float().std().item(),
-                                       ws_pt.float().max().item(), ws_pt[0, 0, :10].float().tolist())
-                    except Exception as e:
-                        logger.info("DEBUG MLP WEIGHT_SCALE_ERROR: prefix=%s, error=%s", self.prefix, str(e))
-
         x = self.experts(hidden_states=x, router_logits=g)[:, : self.hidden_size]
-
-        # DEBUG: Log MoE output for draft model layer 0
-        if "draft_model" in self.prefix and self.layer_idx == 0 and x.shape[0] < 100:
-            count = _mlp_block_debug_counter.get(f"{self.prefix}_output", 0)
-            if count < 2:
-                _mlp_block_debug_counter[f"{self.prefix}_output"] = count + 1
-                logger.info("DEBUG MLP OUTPUT: prefix=%s, shape=%s, mean=%.4f, std=%.4f, min=%.4f, max=%.4f, first_5=%s",
-                           self.prefix, x.shape, x.float().mean().item(), x.float().std().item(),
-                           x.float().min().item(), x.float().max().item(),
-                           x[0, :5].float().tolist())
 
         if self.is_sequence_parallel:
             x = tensor_model_parallel_all_gather(x.contiguous(), 0)
             x = x[:num_tokens]
         return x
 
-
-_transformer_block_debug_counter = {}
 
 class TransformerBlock(torch.nn.Module):
     def __init__(
@@ -307,48 +226,19 @@ class TransformerBlock(torch.nn.Module):
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
         residual: torch.Tensor | None,
-    ) -> torch.Tensor:
-        from vllm.logger import init_logger
-        logger = init_logger(__name__)
-
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
         hidden_states = self.attn(hidden_states, positions)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
-
-        # DEBUG: Log before MLP for draft model layer 0
-        if "draft_model" in self.prefix and self.layer_idx == 0 and hidden_states.shape[0] < 100:
-            count = _transformer_block_debug_counter.get(f"{self.prefix}_pre_mlp", 0)
-            if count < 2:
-                _transformer_block_debug_counter[f"{self.prefix}_pre_mlp"] = count + 1
-                logger.info("DEBUG LAYER0 PRE_MLP: prefix=%s, shape=%s, mean=%.4f, std=%.4f, min=%.4f, max=%.4f",
-                           self.prefix, hidden_states.shape,
-                           hidden_states.float().mean().item(),
-                           hidden_states.float().std().item(),
-                           hidden_states.float().min().item(),
-                           hidden_states.float().max().item())
-                logger.info("DEBUG LAYER0 RESIDUAL: shape=%s, mean=%.4f, std=%.4f",
-                           residual.shape, residual.float().mean().item(), residual.float().std().item())
-
         output = self.mlp(hidden_states)
-
-        # DEBUG: Log after MLP for draft model layer 0
-        if "draft_model" in self.prefix and self.layer_idx == 0 and output.shape[0] < 100:
-            count = _transformer_block_debug_counter.get(f"{self.prefix}_post_mlp", 0)
-            if count < 2:
-                _transformer_block_debug_counter[f"{self.prefix}_post_mlp"] = count + 1
-                logger.info("DEBUG LAYER0 POST_MLP: prefix=%s, shape=%s, mean=%.4f, std=%.4f, min=%.4f, max=%.4f",
-                           self.prefix, output.shape,
-                           output.float().mean().item(),
-                           output.float().std().item(),
-                           output.float().min().item(),
-                           output.float().max().item())
 
         return output, residual
 
