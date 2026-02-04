@@ -223,15 +223,32 @@ class ForwardContext:
     # If True, bypass the compiled model call, e.g. by using .forward() directly
     skip_compiled: bool = False
 
-    # For torch.compile, we store the list of MoE layer names here.
-    # Each MoE layer stores its index at registration time and encodes it
-    # in the layer name string (e.g., "from_forward_context:42"), allowing
-    # direct lookup without a counter. This approach works correctly with
-    # speculative decoding where multiple models share the same vllm_config.
+    # For torch.compile cold start times, we need to avoid hard-coding
+    # any strings into the graph. Right now, the vllm.moe_forward
+    # and vllm.moe_forward_shared custom operators hard-code strings into
+    # the graph.
     #
-    # If this value is None (like in some tests), the layer name string
-    # is baked directly into the graph.
+    # The workaround is to store a list of the strings that each of those
+    # custom ops needs in the ForwardContext (all_moe_layers)
+    # as well as a counter (moe_layer_index).
+    # The ForwardContext object is alive for the duration of the forward pass.
+    # When the custom op needs a layer string, get the next string
+    # from all_moe_layers and increment the counter.
+    #
+    # This assumes that the custom operators will always be executed in
+    # order and that torch.compile will not try to reorder these
+    # operations with respect to each other.
+    #
+    # TODO(https://github.com/vllm-project/vllm/issues/31985):
+    # There are longer-term solutions, like unwrapping the moe custom operator,
+    # that aren't ready yet.
+    # We could also treat the string as a "symbolic input" to the graph but
+    # the PyTorch-side bits for that aren't ready yet either.
+    #
+    # If this value is None (like in some tests), then we end up baking the string
+    # into the graph. Otherwise, the moe custom ops will pop a string from this list.
     all_moe_layers: list[str] | None = None
+    moe_layer_index: int = 0
 
     additional_kwargs: dict[str, Any] = field(default_factory=dict)
 

@@ -409,10 +409,6 @@ class FusedMoE(CustomOp):
             raise ValueError("Duplicate layer name: {}".format(prefix))
         compilation_config.static_forward_context[prefix] = self
         compilation_config.static_all_moe_layers.append(prefix)
-        # Read the current length of all_moe_layers to assign a
-        # unique index to this layer.
-        curr_len = len(compilation_config.static_all_moe_layers) - 1
-        self.moe_layer_index = curr_len
         self.layer_name = prefix
 
         self.enable_eplb = enable_eplb
@@ -1614,12 +1610,7 @@ class FusedMoE(CustomOp):
                 is_forward_context_available()
                 and get_forward_context().all_moe_layers is not None
             ):
-                # Use the stored index directly instead of a counter.
-                # This fixes speculative decoding where draft and target models
-                # share the same vllm_config - the counter doesn't know which
-                # model is calling and would resolve draft layers to target layers.
-                # The index is stored at registration time and is always correct.
-                return f"from_forward_context:{self.moe_layer_index}"
+                return "from_forward_context"
             return self.layer_name
 
         if self.shared_experts is None:
@@ -2041,15 +2032,18 @@ class FusedMoE(CustomOp):
 
 def get_layer_from_name(layer_name: str) -> FusedMoE:
     forward_context: ForwardContext = get_forward_context()
-    if layer_name.startswith("from_forward_context:"):
-        # Format: "from_forward_context:{index}" - use index for direct lookup.
-        # Each MoE layer stores its index at registration time, avoiding the
-        # need for a counter. This works correctly with speculative decoding
-        # where draft and target models share the same vllm_config.
-        index = int(layer_name.split(":")[1])
+    if layer_name == "from_forward_context":
         all_moe_layers = forward_context.all_moe_layers
         assert all_moe_layers is not None
-        layer_name = all_moe_layers[index]
+        moe_layer_index = forward_context.moe_layer_index
+        if moe_layer_index >= len(all_moe_layers):
+            raise AssertionError(
+                "We expected the number of MOE layers in `all_moe_layers` "
+                "to be equal to the number of "
+                "{vllm.moe_forward, vllm.moe_forward_shared} calls."
+            )
+        layer_name = all_moe_layers[moe_layer_index]
+        forward_context.moe_layer_index += 1
     self = cast(FusedMoE, forward_context.no_compile_layers[layer_name])
     return self
 
