@@ -279,7 +279,7 @@ class SpecDecodeBaseProposer:
             device=self.hidden_states.device,
         )
 
-    def _get_slot_mapping_buffer_for_inference(
+    def _get_slot_mapping(
         self,
         num_tokens: int,
         cm_by_gid: CommonAttnMetadataByGid,
@@ -308,9 +308,7 @@ class SpecDecodeBaseProposer:
 
         return layer_to_buffer
 
-    def _get_slot_mapping_buffers_for_dummy_run(
-        self, num_tokens: int
-    ) -> dict[str, torch.Tensor]:
+    def _get_slot_mapping_dummy_run(self, num_tokens: int) -> dict[str, torch.Tensor]:
         """Return slot_mapping dict for EAGLE/draft layers during dummy run.
         Uses per-gid buffer (gid 0).
         """
@@ -377,8 +375,7 @@ class SpecDecodeBaseProposer:
         batch_size = common_attn_metadata.batch_size()
 
         # Build attention metadata for each KV cache group
-        per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
-
+        # then build it for each layer.
         attn_metadata_by_gid: dict[int, AttentionMetadata] = {}
         for gid, cm in cm_by_gid.items():
             builder = self._get_metadata_builder(gid)
@@ -387,6 +384,7 @@ class SpecDecodeBaseProposer:
             )
             attn_metadata_by_gid[gid] = attn_metadata
 
+        per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
         for layer_name in self.attn_layer_names:
             gid = self.layer_names_to_kv_cache_gid[layer_name]
             per_layer_attn_metadata[layer_name] = attn_metadata_by_gid[gid]
@@ -451,17 +449,17 @@ class SpecDecodeBaseProposer:
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
-            slot_mapping=self._get_slot_mapping_buffer_for_inference(
+            slot_mapping=self._get_slot_mapping(
                 num_tokens=num_input_tokens,
                 cm_by_gid=cm_by_gid,
             ),
         ):
             ret_hidden_states = self.model(**model_kwargs)
-        if not self.model_returns_tuple():
-            last_hidden_states = ret_hidden_states
-            hidden_states = last_hidden_states
-        else:
-            last_hidden_states, hidden_states = ret_hidden_states
+            if not self.model_returns_tuple():
+                last_hidden_states = ret_hidden_states
+                hidden_states = last_hidden_states
+            else:
+                last_hidden_states, hidden_states = ret_hidden_states
 
         sample_hidden_states = last_hidden_states[last_token_indices]
         logits = self.model.compute_logits(sample_hidden_states)
@@ -599,7 +597,7 @@ class SpecDecodeBaseProposer:
                     block_table_tensor=cm.block_table_tensor,
                 )
 
-            # Compute per-group slot mappings and rebuild attention metadata.
+            # Compute the slot mapping for each kv-cache group
             attn_metadata_by_gid = {}
             for gid, cm in cm_by_gid.items():
                 blk_table_tensor = cm.block_table_tensor
@@ -636,6 +634,7 @@ class SpecDecodeBaseProposer:
                 cm_by_gid[gid] = new_cm
                 attn_metadata_by_gid[gid] = attn_metadata
 
+            # Rebuild attention metadata
             for layer_name in self.attn_layer_names:
                 gid = self.layer_names_to_kv_cache_gid[layer_name]
                 per_layer_attn_metadata[layer_name] = attn_metadata_by_gid[gid]
@@ -668,7 +667,7 @@ class SpecDecodeBaseProposer:
                 num_tokens=input_batch_size,
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
-                slot_mapping=self._get_slot_mapping_buffer_for_inference(
+                slot_mapping=self._get_slot_mapping(
                     num_tokens=input_batch_size,
                     cm_by_gid=cm_by_gid,
                 ),
@@ -853,8 +852,6 @@ class SpecDecodeBaseProposer:
         new_query_len_per_req = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
 
         total_num_tokens = query_start_loc_cpu[-1].item()
-        max_query_len = new_query_len_per_req.max().item()
-        max_seq_len = common_attn_metadata.seq_lens_cpu.max().item()
 
         # First create the new base CAM with transformed shared fields
         new_cam = CommonAttentionMetadata(
@@ -865,10 +862,11 @@ class SpecDecodeBaseProposer:
             _num_computed_tokens_cpu=common_attn_metadata._num_computed_tokens_cpu,
             num_reqs=common_attn_metadata.num_reqs,
             num_actual_tokens=total_num_tokens,
-            max_query_len=max_query_len,
-            max_seq_len=max_seq_len,
-            block_table_tensor=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
+            max_query_len=new_query_len_per_req.max().item(),
+            max_seq_len=common_attn_metadata.seq_lens_cpu.max().item(),
+            # block-table and slot-mapping are set below
+            block_table_tensor=torch.empty(0),
+            slot_mapping=torch.empty(0),
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
@@ -879,7 +877,7 @@ class SpecDecodeBaseProposer:
         for gid, cm in cm_by_gid.items():
             new_cm_by_gid[gid] = new_cam.replace(
                 block_table_tensor=cm.block_table_tensor,
-                slot_mapping=cm.slot_mapping,
+                slot_mapping=cm.slot_mapping[:total_num_tokens],
             )
 
         return (
@@ -994,7 +992,7 @@ class SpecDecodeBaseProposer:
             # sequence length to 1 to minimize their overheads in attention.
             attn_metadata.seq_lens.masked_fill_(exceeds_max_model_len, 1)
 
-            # Compute slot mapping
+            # Compute the slot mapping.
             block_size = tree_attn_metadata_builder.kv_cache_spec.block_size
             query_positions = flattened_draft_positions[:, level : level + query_len]
             block_numbers = query_positions // block_size
@@ -1023,7 +1021,7 @@ class SpecDecodeBaseProposer:
                 self.vllm_config,
                 num_tokens=num_input_tokens,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
-                slot_mapping=self._get_slot_mapping_buffer_for_inference(
+                slot_mapping=self._get_slot_mapping(
                     num_tokens=num_input_tokens,
                     cm_by_gid=cm_by_gid,
                 ),
@@ -1161,8 +1159,9 @@ class SpecDecodeBaseProposer:
             num_actual_tokens=total_num_tokens,
             max_query_len=new_query_len_per_req.max().item(),
             max_seq_len=new_seq_lens_cpu.max().item(),
-            block_table_tensor=common_attn_metadata.block_table_tensor,
-            slot_mapping=common_attn_metadata.slot_mapping,
+            # block-table and slot-mapping are set below
+            block_table_tensor=torch.empty(0),
+            slot_mapping=torch.empty(0),
             causal=True,
             dcp_local_seq_lens=common_attn_metadata.dcp_local_seq_lens,
         )
@@ -1173,7 +1172,7 @@ class SpecDecodeBaseProposer:
         for gid, cm in cm_by_gid.items():
             new_cm_by_gid[gid] = new_cam.replace(
                 block_table_tensor=cm.block_table_tensor,
-                slot_mapping=cm.slot_mapping,
+                slot_mapping=cm.slot_mapping[token_indices],
             )
 
         return new_cm_by_gid, token_indices
@@ -1413,7 +1412,7 @@ class SpecDecodeBaseProposer:
                 and slot_mappings is not None
                 and self.attn_layer_names[0] in slot_mappings
             ):
-                slot_mapping_dict = self._get_slot_mapping_buffers_for_dummy_run(
+                slot_mapping_dict = self._get_slot_mapping_dummy_run(
                     num_tokens=num_input_tokens
                 )
             else:

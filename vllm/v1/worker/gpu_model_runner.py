@@ -1681,10 +1681,7 @@ class GPUModelRunner(
         num_scheduled_tokens: dict[str, int] | None = None,
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
-    ) -> tuple[
-        PerLayerAttnMetadata,
-        CommonAttnMetadataByGid,
-    ]:
+    ) -> tuple[PerLayerAttnMetadata, CommonAttnMetadataByGid]:
         # Attention metadata is not needed for attention free models
         if len(self.kv_cache_config.kv_cache_groups) == 0:
             return {}, dict()
@@ -1863,7 +1860,6 @@ class GPUModelRunner(
                 num_reqs_padded,
                 for_cudagraph_capture=for_cudagraph_capture,
             )
-            # if kv_cache_gid > 0:
             cm.block_table_tensor = _get_block_table(kv_cache_gid)
             cm.slot_mapping = slot_mappings[kv_cache_gid]
 
@@ -3112,8 +3108,8 @@ class GPUModelRunner(
         has_lora = num_active_loras > 0 if force_has_lora is None else force_has_lora
 
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
-        dispatch_cudagraph = (
-            lambda num_tokens, disable_full: self.cudagraph_dispatcher.dispatch(
+        dispatch_cudagraph = lambda num_tokens, disable_full: (
+            self.cudagraph_dispatcher.dispatch(
                 num_tokens=num_tokens,
                 has_lora=has_lora,
                 uniform_decode=uniform_decode,
@@ -3676,7 +3672,7 @@ class GPUModelRunner(
         self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
-            assert cm_by_gid
+            assert cm_by_gid is not None
             with record_function_or_nullcontext("gpu_model_runner: draft"):
                 self._draft_token_ids = self.propose_draft_token_ids(
                     scheduler_output,
