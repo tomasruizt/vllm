@@ -4254,7 +4254,7 @@ class GPUModelRunner(
             logger.info_once(
                 "FMMS sampler enabled (provider=%s, lm_head weight shape=%s)",
                 envs.VLLM_FMMS_PROVIDER,
-                tuple(self.self.model.lm_head.weight.shape),
+                tuple(self.model.lm_head.weight.shape),
             )
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
