@@ -46,6 +46,8 @@ if TYPE_CHECKING:
     VLLM_LOG_STATS_INTERVAL: float = 10.0
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool | None = None
+    VLLM_USE_FMMS_SAMPLER: bool | None = None
+    VLLM_FMMS_PROVIDER: str = "fused-triton"
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = ""
@@ -667,6 +669,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     )
     if "VLLM_USE_FLASHINFER_SAMPLER" in os.environ
     else None,
+    # If set, vllm will use FMMS (Fused Matrix Multiplication & Sampling)
+    # sampler, which fuses the lm_head matmul with Gumbel-max sampling.
+    # Only supports temperature-only sampling (no top-k/top-p/penalties).
+    "VLLM_USE_FMMS_SAMPLER": lambda: bool(int(os.environ["VLLM_USE_FMMS_SAMPLER"]))
+    if "VLLM_USE_FMMS_SAMPLER" in os.environ
+    else None,
+    # FMMS kernel provider: "fused-triton" or "helion"
+    "VLLM_FMMS_PROVIDER": lambda: os.getenv("VLLM_FMMS_PROVIDER", "fused-triton"),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
     # (CPU backend only) CPU key-value cache space.
