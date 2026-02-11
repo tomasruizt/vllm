@@ -11,6 +11,7 @@ import torch
 
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.utils import record_function_or_nullcontext
 
 
 class FMMSSampler:
@@ -24,6 +25,15 @@ class FMMSSampler:
         self.sampler = sampler.prepare()
 
     def __call__(
+        self,
+        lm_head_weight: torch.Tensor,
+        hidden_states: torch.Tensor,
+        sampling_metadata: SamplingMetadata,
+    ) -> SamplerOutput:
+        with record_function_or_nullcontext("fmms_sampler.sample"):
+            return self._sample(lm_head_weight, hidden_states, sampling_metadata)
+
+    def _sample(
         self,
         lm_head_weight: torch.Tensor,
         hidden_states: torch.Tensor,

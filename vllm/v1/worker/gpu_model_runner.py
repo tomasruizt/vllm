@@ -3589,7 +3589,8 @@ class GPUModelRunner(
                 if self.use_fmms_sampler:
                     logits = None
                 else:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                    with record_function_or_nullcontext("model.compute_logits"):
+                        logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
