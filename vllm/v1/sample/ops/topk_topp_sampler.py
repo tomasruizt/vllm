@@ -253,8 +253,10 @@ def apply_top_k_top_p(
 ) -> torch.Tensor:
     if p is None and k is None:
         return logits
-    raise NotImplementedError(
-        "top-k/top-p sampling is not supported in the FMMS baseline comparison"
+    logger.warning_once(
+        "top-k/top-p sampling is not meant to be used in the FMMS baseline "
+        "comparison. Falling back to the upstream implementation. This warning "
+        "should only appear once during the dummy profile run."
     )
 
     if HAS_TRITON and logits.shape[0] >= 8:
