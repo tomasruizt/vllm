@@ -377,7 +377,7 @@ class ExecuteModelState(NamedTuple):
     sample_tokens(), after execute_model() returns None."""
 
     scheduler_output: "SchedulerOutput"
-    logits: torch.Tensor
+    logits: torch.Tensor | None
     spec_decode_metadata: SpecDecodeMetadata | None
     spec_decode_common_attn_metadata: CommonAttentionMetadata | None
     hidden_states: torch.Tensor
@@ -478,6 +478,15 @@ class GPUModelRunner(
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+
+        # FMMS (Fused Matrix Multiplication & Sampling) sampler
+        self.use_fmms_sampler = bool(envs.VLLM_USE_FMMS_SAMPLER)
+        if self.use_fmms_sampler:
+            from vllm.v1.sample.fmms_sampler import FMMSSampler
+
+            self.fmms_sampler = FMMSSampler(
+                provider=envs.VLLM_FMMS_PROVIDER,
+            )
 
         self.eplb_state: EplbState | None = None
         # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
@@ -3309,12 +3318,22 @@ class GPUModelRunner(
         self,
         logits: torch.Tensor | None,
         spec_decode_metadata: SpecDecodeMetadata | None,
+        sample_hidden_states: torch.Tensor | None = None,
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
+
+        # FMMS: fused matmul + sampling, skip normal sampler path.
+        if self.use_fmms_sampler and logits is None:
+            return self.fmms_sampler(
+                lm_head_weight=self.model.lm_head.weight,
+                hidden_states=sample_hidden_states,
+                sampling_metadata=sampling_metadata,
+            )
+
         if spec_decode_metadata is None:
             return self.sampler(
                 logits=logits,
@@ -4056,7 +4075,11 @@ class GPUModelRunner(
                     )
 
                 sample_hidden_states = hidden_states[logits_indices]
-                logits = self.model.compute_logits(sample_hidden_states)
+                if self.use_fmms_sampler:
+                    logits = None
+                else:
+                    with record_function_or_nullcontext("model.compute_logits"):
+                        logits = self.model.compute_logits(sample_hidden_states)
             else:
                 # Rare case.
                 assert not self.is_pooling_model
@@ -4153,7 +4176,9 @@ class GPUModelRunner(
             )
 
         with record_function_or_nullcontext("gpu_model_runner: sample"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            sampler_output = self._sample(
+                logits, spec_decode_metadata, sample_hidden_states
+            )
 
         self._update_states_after_model_execute(
             sampler_output.sampled_token_ids, scheduler_output
@@ -4829,6 +4854,14 @@ class GPUModelRunner(
                 drafter_model := getattr(drafter, "model", None)
             ):
                 prepare_communication_buffer_for_model(drafter_model)
+
+        # Capture lm_head weight for FMMS sampler (fused matmul + sampling).
+        if self.use_fmms_sampler:
+            logger.info_once(
+                "FMMS sampler enabled (provider=%s, lm_head weight shape=%s)",
+                envs.VLLM_FMMS_PROVIDER,
+                tuple(self.model.lm_head.weight.shape),
+            )
         mm_config = self.model_config.multimodal_config
         self.is_multimodal_pruning_enabled = (
             supports_multimodal_pruning(self.get_model())

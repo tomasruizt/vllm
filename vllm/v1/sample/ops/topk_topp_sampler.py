@@ -12,6 +12,7 @@ from vllm.config.model import LogprobsMode
 from vllm.logger import init_logger
 from vllm.platforms import CpuArchEnum, current_platform
 from vllm.triton_utils import HAS_TRITON
+from vllm.v1.utils import record_function_or_nullcontext
 
 if HAS_TRITON:
     from vllm.v1.sample.ops.topk_topp_triton import apply_top_k_top_p_triton
@@ -98,11 +99,16 @@ class TopKTopPSampler(nn.Module):
         k: torch.Tensor | None,
         p: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        with record_function_or_nullcontext("TopKTopPSampler.forward_native()"):
+            return self._forward_native(logits, generators, k, p)
+
+    def _forward_native(self, logits, generators, k, p):
         """
         PyTorch-native implementation of top-k and top-p sampling.
 
         The logits tensor may be updated in-place.
         """
+        logger.info_once("Using TopKTopPSampler.forward_native()")
         logits = apply_top_k_top_p(logits, k, p)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
@@ -247,6 +253,11 @@ def apply_top_k_top_p(
 ) -> torch.Tensor:
     if p is None and k is None:
         return logits
+    logger.warning_once(
+        "top-k/top-p sampling is not meant to be used in the FMMS baseline "
+        "comparison. Falling back to the upstream implementation. This warning "
+        "should only appear once during the dummy profile run."
+    )
 
     if HAS_TRITON and logits.shape[0] >= 8:
         return apply_top_k_top_p_triton(logits, k, p)
