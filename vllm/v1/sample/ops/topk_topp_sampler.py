@@ -109,7 +109,7 @@ class TopKTopPSampler(nn.Module):
         The logits tensor may be updated in-place.
         """
         logger.info_once("Using TopKTopPSampler.forward_native()")
-        logits = self.apply_top_k_top_p(logits, k, p)
+        logits = apply_top_k_top_p(logits, k, p)
         logits_to_return = None
         if self.logprobs_mode == "processed_logits":
             logits_to_return = logits
