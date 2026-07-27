@@ -17,12 +17,14 @@ from vllm.v1.utils import record_function_or_nullcontext
 class FMMSSampler:
     def __init__(self, provider: str = "fused-triton"):
         from fused_mm_sampling.core import get_sampler
+        from fused_mm_sampling.tp_info import TPInfo
 
         # get_sampler needs a weights tensor for some providers (e.g. JL),
         # but fused-triton and helion don't, so pass a dummy.
         dummy = torch.empty(1, 1)
         sampler = get_sampler(provider, weights=dummy)
         self.sampler = sampler.prepare()
+        self.tp = TPInfo.from_world()
 
     def __call__(
         self,
@@ -48,6 +50,7 @@ class FMMSSampler:
             hidden_states=hidden_states,
             num_samples=1,
             temperature=temperature[0],
+            tp=self.tp,
         )  # [B, 1] torch.long
 
         return SamplerOutput(
