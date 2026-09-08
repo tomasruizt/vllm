@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
 from typing import Literal
 
 from pydantic import Field, model_validator
@@ -11,12 +12,13 @@ from vllm.logger import init_logger
 
 logger = init_logger(__name__)
 
-WatermarkingAlgorithm = Literal["gumbel"]
+WatermarkingAlgorithm = Literal["gumbel", "dual_key_gumbel"]
 WatermarkPRFName = Literal["philox"]
 
-_SPECULATIVE_DECODING_SUPPORT: dict[WatermarkingAlgorithm, bool] = {
-    "gumbel": False,
-}
+
+def derive_watermark_key(key: int, domain: bytes) -> int:
+    digest = hashlib.sha256(domain + key.to_bytes(8, "big")).digest()
+    return int.from_bytes(digest[:8], "big")
 
 
 @config
@@ -46,4 +48,4 @@ class WatermarkConfig:
 
     @property
     def supports_speculative_decoding(self) -> bool:
-        return _SPECULATIVE_DECODING_SUPPORT[self.algorithm]
+        return self.algorithm == "dual_key_gumbel"
