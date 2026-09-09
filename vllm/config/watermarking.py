@@ -29,6 +29,8 @@ class WatermarkConfig:
     """Secret key used to watermark generated text."""
     algorithm: WatermarkingAlgorithm = "gumbel"
     """Algorithm used to watermark generated text."""
+    alpha: float = Field(default=0.5, ge=0, le=1)
+    """Probability of selecting key B for dual-key watermarking."""
     context_width: int = Field(default=4, ge=1)
     """Number of prior output tokens used by the watermark PRF."""
     prf: WatermarkPRFName = "philox"
