@@ -8,13 +8,17 @@ import pytest
 import torch
 
 from vllm import SamplingParams
-from vllm.config.watermarking import WatermarkConfig
-from vllm.v1.watermarking import (
-    DualKeyGumbelWatermarker,
-    create_watermarker,
+from vllm.config.watermarking import (
+    AcceptanceRandomness,
+    SpeculativeVerification,
+    WatermarkConfig,
+    WatermarkRole,
     derive_watermark_key,
 )
+from vllm.v1.watermarking import GumbelWatermarker, create_watermarker
+from vllm.v1.watermarking.factory import create_watermark_scheme
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
+from vllm.v1.watermarking.scheme import DomainSeparatedWatermarkKeySchedule
 from vllm.v1.watermarking.spec_decode import DraftWatermarker
 from vllm.v1.watermarking.watermarker import WatermarkSample
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -65,15 +69,42 @@ def test_large_context_width_warns_but_is_allowed():
 
 def test_dual_key_watermarker_uses_domain_separated_keys():
     config = WatermarkConfig(algorithm="dual_key_gumbel", key=42)
+    scheme = create_watermark_scheme(config)
 
-    target = create_watermarker(config)
-    draft = create_watermarker(config, is_drafting=True)
+    target = scheme.watermarker_for(WatermarkRole.TARGET)
+    draft = scheme.watermarker_for(WatermarkRole.DRAFT)
 
-    assert isinstance(target, DualKeyGumbelWatermarker)
-    assert target.supports_speculative_decoding
+    assert isinstance(target, GumbelWatermarker)
+    assert isinstance(scheme.key_schedule, DomainSeparatedWatermarkKeySchedule)
+    assert scheme.speculative_policy == config.speculative_decoding_policy
+    assert scheme.speculative_policy is not None
+    assert scheme.speculative_policy.verification is SpeculativeVerification.ORDINARY
+    assert (
+        scheme.speculative_policy.acceptance_randomness is AcceptanceRandomness.RANDOM
+    )
     assert target.prf.key == derive_watermark_key(42, b"target")
     assert draft.prf.key == derive_watermark_key(42, b"draft")
     assert target.prf.key != draft.prf.key
+    acceptance_key = scheme.key_schedule.key_for(WatermarkRole.ACCEPTANCE)
+    assert acceptance_key not in (target.prf.key, draft.prf.key)
+
+
+def test_gumbel_scheme_uses_one_key_for_all_roles():
+    config = WatermarkConfig(algorithm="gumbel", key=42)
+    scheme = create_watermark_scheme(config)
+
+    assert scheme.speculative_policy is None
+    assert scheme.key_schedule.key_for(WatermarkRole.DRAFT) == config.key
+    assert scheme.key_schedule.key_for(WatermarkRole.TARGET) == config.key
+
+
+def test_dual_key_generation_uses_target_role():
+    config = WatermarkConfig(algorithm="dual_key_gumbel", key=42)
+
+    generation = create_watermarker(config)
+    target = create_watermarker(config, role=WatermarkRole.TARGET)
+
+    assert generation.prf.key == target.prf.key
 
 
 def test_dual_key_derivation_is_stable():
@@ -245,6 +276,8 @@ def test_draft_sampler_uses_draft_key_and_advances_context(monkeypatch):
             return torch.zeros(hidden_states.shape[0], 8)
 
     class StubWatermarker:
+        context_width = 2
+
         @staticmethod
         def sample(logits, contexts, random_sample):
             return WatermarkSample(torch.tensor([7, 7]), logits)
@@ -252,10 +285,12 @@ def test_draft_sampler_uses_draft_key_and_advances_context(monkeypatch):
     speculator = object.__new__(StubSpeculator)
     speculator.model = StubModel()
     speculator.use_fp64_gumbel = False
-    draft_watermarker = object.__new__(DraftWatermarker)
-    draft_watermarker.watermarker = StubWatermarker()
-    draft_watermarker.contexts = torch.tensor([[1, 2], [3, 4]])
-    draft_watermarker.enabled = torch.tensor([True, False])
+    draft_watermarker = DraftWatermarker(
+        StubWatermarker(), max_num_reqs=2, device=torch.device("cpu")
+    )
+    draft_watermarker.prepare(
+        torch.tensor([[1, 2], [3, 4]]), torch.tensor([True, False])
+    )
     speculator.draft_watermarker = draft_watermarker
     monkeypatch.setattr(
         "vllm.v1.worker.gpu.spec_decode.speculator.gumbel_sample",

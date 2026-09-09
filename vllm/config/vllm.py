@@ -1136,7 +1136,7 @@ class VllmConfig:
             return
         if (
             self.speculative_config is not None
-            and not watermark_config.supports_speculative_decoding
+            and watermark_config.speculative_decoding_policy is None
         ):
             raise ValueError(
                 f"The {watermark_config.algorithm} watermarking algorithm "

@@ -41,11 +41,12 @@ contexts. Values above 16 are allowed but emit a warning.
 
 ## Architecture
 
-`WatermarkConfig` selects an algorithm and PRF. Model Runner V2 constructs the
-corresponding `Watermarker`, and `GPUWatermarkSampler` invokes it for the final
-stochastic token selection after temperature, min-p, top-k, and top-p are
-applied. A watermarker can either select a token directly or transform logits
-and delegate to vLLM's random sampler.
+`WatermarkConfig` selects an algorithm and PRF. Model Runner V2 constructs a
+scheme that combines the token-selection algorithm, key schedule, and any
+speculative-decoding policy. `GPUWatermarkSampler` invokes the resulting
+`Watermarker` for the final stochastic token selection after temperature,
+min-p, top-k, and top-p are applied. A watermarker can either select a token
+directly or transform logits and delegate to vLLM's random sampler.
 
 Detection is separate from generation. vLLM provides detector primitives for
 the reference algorithms. `WatermarkDetector` consumes token IDs, so callers
@@ -161,9 +162,7 @@ watermarked output or to modify watermarked text so it is no longer detected.
 ## Limitations
 
 - Watermarking is currently available only with Model Runner V2.
-- Speculative-decoding support depends on the configured watermark algorithm;
-  check the watermarker's `supports_speculative_decoding` capability before
-  combining them.
+- Not all watermarking algorithms support speculative decoding.
 - Beam search expands candidates from model log probabilities and does not apply
   Gumbel-max watermarking.
 - Models that replace the vLLM sampler with a custom sampler cannot use

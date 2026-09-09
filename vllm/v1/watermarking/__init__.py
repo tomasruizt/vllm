@@ -6,7 +6,6 @@ from vllm.v1.watermarking.detector import WatermarkDetection, WatermarkDetector
 from vllm.v1.watermarking.factory import create_watermarker
 from vllm.v1.watermarking.gumbel import (
     DualKeyGumbelWatermarkDetector,
-    DualKeyGumbelWatermarker,
     GumbelWatermarkDetector,
     GumbelWatermarker,
 )
@@ -19,7 +18,6 @@ from vllm.v1.watermarking.watermarker import Watermarker, WatermarkSample
 
 __all__ = [
     "DualKeyGumbelWatermarkDetector",
-    "DualKeyGumbelWatermarker",
     "GumbelWatermarkDetector",
     "GumbelWatermarker",
     "PhiloxPRF",
