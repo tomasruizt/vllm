@@ -54,7 +54,7 @@ def test_watermark_config_cli():
             "dummy",
             "--watermark-config",
             '{"algorithm":"gumbel","key":42,"prf":"philox",'
-            '"allow_target_only_speculative_decoding":true}',
+            '"allow_target_only_watermarking":true}',
         ]
     )
 
@@ -65,7 +65,7 @@ def test_watermark_config_cli():
     assert config.key == 42
     assert config.context_width == 4
     assert config.prf == "philox"
-    assert config.allow_target_only_speculative_decoding
+    assert config.allow_target_only_watermarking
 
 
 @pytest.mark.parametrize(
