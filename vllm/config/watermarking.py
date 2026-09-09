@@ -2,8 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import hashlib
-from dataclasses import dataclass
-from enum import Enum
 from typing import Literal
 
 from pydantic import Field, model_validator
@@ -16,39 +14,6 @@ logger = init_logger(__name__)
 
 WatermarkingAlgorithm = Literal["gumbel", "dual_key_gumbel"]
 WatermarkPRFName = Literal["philox"]
-
-
-class WatermarkRole(str, Enum):
-    GENERATION = "generation"
-    DRAFT = "draft"
-    TARGET = "target"
-    ACCEPTANCE = "acceptance"
-
-
-class SpeculativeVerification(str, Enum):
-    ORDINARY = "ordinary"
-    WATERMARKED = "watermarked"
-
-
-class AcceptanceRandomness(str, Enum):
-    RANDOM = "random"
-    KEYED = "keyed"
-
-
-@dataclass(frozen=True)
-class SpeculativeWatermarkPolicy:
-    draft_role: WatermarkRole
-    target_role: WatermarkRole
-    verification: SpeculativeVerification
-    acceptance_randomness: AcceptanceRandomness
-
-
-FAST_SPECULATIVE_WATERMARK_POLICY = SpeculativeWatermarkPolicy(
-    draft_role=WatermarkRole.DRAFT,
-    target_role=WatermarkRole.TARGET,
-    verification=SpeculativeVerification.ORDINARY,
-    acceptance_randomness=AcceptanceRandomness.RANDOM,
-)
 
 
 def derive_watermark_key(key: int, domain: bytes) -> int:
@@ -82,7 +47,5 @@ class WatermarkConfig:
         return self
 
     @property
-    def speculative_decoding_policy(self) -> SpeculativeWatermarkPolicy | None:
-        if self.algorithm == "dual_key_gumbel":
-            return FAST_SPECULATIVE_WATERMARK_POLICY
-        return None
+    def supports_speculative_decoding(self) -> bool:
+        return self.algorithm == "dual_key_gumbel"
