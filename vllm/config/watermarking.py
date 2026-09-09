@@ -33,6 +33,8 @@ class WatermarkConfig:
     """Number of prior output tokens used by the watermark PRF."""
     prf: WatermarkPRFName = "philox"
     """Pseudorandom function used by the watermarking algorithm."""
+    allow_target_only_speculative_decoding: bool = False
+    """Allow speculative decoding without watermarking draft tokens."""
 
     @model_validator(mode="after")
     def validate_key(self) -> Self:
@@ -45,7 +47,3 @@ class WatermarkConfig:
                 scope="global",
             )
         return self
-
-    @property
-    def supports_speculative_decoding(self) -> bool:
-        return self.algorithm == "dual_key_gumbel"

@@ -4,7 +4,8 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import ClassVar, TypeAlias
+from enum import Enum
+from typing import Protocol, TypeAlias, runtime_checkable
 
 import torch
 
@@ -18,8 +19,6 @@ class WatermarkSample:
 
 
 class Watermarker(ABC):
-    supports_speculative_decoding: ClassVar[bool] = False
-
     @property
     @abstractmethod
     def context_width(self) -> int:
@@ -33,3 +32,21 @@ class Watermarker(ABC):
         random_sample: RandomSampler,
     ) -> WatermarkSample:
         raise NotImplementedError
+
+
+class SpeculativeVerification(str, Enum):
+    STANDARD = "standard"
+    WATERMARKED = "watermarked"
+
+
+class AcceptanceRandomness(str, Enum):
+    RANDOM = "random"
+    KEYED = "keyed"
+
+
+@runtime_checkable
+class SupportsSpeculativeDecoding(Protocol):
+    speculative_verification: SpeculativeVerification
+    acceptance_randomness: AcceptanceRandomness
+
+    def create_draft_watermarker(self) -> Watermarker: ...
