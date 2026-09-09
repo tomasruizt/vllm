@@ -5,11 +5,8 @@ import numpy as np
 import torch
 
 from vllm.config import SpeculativeConfig
-from vllm.config.watermarking import (
-    AcceptanceRandomness,
-    SpeculativeVerification,
-    SpeculativeWatermarkPolicy,
-)
+from vllm.config.watermarking import WatermarkConfig
+from vllm.v1.watermarking.factory import create_watermarker
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.watermarker import Watermarker
 from vllm.v1.worker.gpu.spec_decode.rejection_sampler import RejectionSampler
@@ -19,14 +16,14 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import rejection_sam
 class DraftWatermarker:
     def __init__(
         self,
-        watermarker: Watermarker,
+        config: WatermarkConfig,
         max_num_reqs: int,
         device: torch.device,
     ) -> None:
-        self.watermarker = watermarker
+        self.watermarker = create_watermarker(config, is_drafting=True)
         self.contexts = torch.zeros(
             max_num_reqs,
-            watermarker.context_width,
+            config.context_width,
             dtype=torch.int64,
             device=device,
         )
@@ -172,19 +169,10 @@ class WatermarkedRejectionSampler(RejectionSampler):
         sampler: GPUWatermarkSampler,
         spec_config: SpeculativeConfig,
         device: torch.device,
-        target_watermarker: Watermarker,
-        policy: SpeculativeWatermarkPolicy,
+        watermark_config: WatermarkConfig,
     ) -> None:
-        if (
-            policy.verification is not SpeculativeVerification.ORDINARY
-            or policy.acceptance_randomness is not AcceptanceRandomness.RANDOM
-        ):
-            raise NotImplementedError(
-                "WatermarkedRejectionSampler only implements fast watermarked "
-                "speculative sampling"
-            )
         super().__init__(sampler, spec_config, device)
-        self.watermarker = target_watermarker
+        self.watermarker = create_watermarker(watermark_config)
 
     def _verify(
         self,
