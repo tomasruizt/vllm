@@ -64,7 +64,7 @@ def test_watermark_config_cli():
     assert config.key == 42
     assert config.context_width == 4
     assert config.prf == "philox"
-    assert not config.supports_speculative_decoding
+    assert config.speculative_decoding_policy is None
 
 
 @pytest.mark.parametrize(

@@ -17,6 +17,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.models import supports_multimodal_embeddings
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.watermarking.factory import create_watermark_scheme
 from vllm.v1.watermarking.spec_decode import DraftWatermarker
 from vllm.v1.worker.gpu.attn_utils import (
     build_attn_metadata,
@@ -168,8 +169,11 @@ class DraftModelSpeculator(BaseSpeculator):
 
         self.draft_watermarker: DraftWatermarker | None = None
         if watermark_config := vllm_config.watermark_config:
+            watermark_scheme = create_watermark_scheme(watermark_config)
+            speculative_policy = watermark_scheme.speculative_policy
+            assert speculative_policy is not None
             self.draft_watermarker = DraftWatermarker(
-                watermark_config,
+                watermark_scheme.watermarker_for(speculative_policy.draft_role),
                 self.max_num_reqs,
                 device,
             )

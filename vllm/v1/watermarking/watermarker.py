@@ -4,7 +4,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import ClassVar, TypeAlias
+from typing import TypeAlias
 
 import torch
 
@@ -18,8 +18,6 @@ class WatermarkSample:
 
 
 class Watermarker(ABC):
-    supports_speculative_decoding: ClassVar[bool] = False
-
     @property
     @abstractmethod
     def context_width(self) -> int:

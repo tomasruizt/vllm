@@ -78,7 +78,7 @@ from vllm.v1.outputs import (
     ModelRunnerOutput,
     RoutedExpertsTensors,
 )
-from vllm.v1.watermarking import create_watermarker
+from vllm.v1.watermarking.factory import create_watermark_scheme
 from vllm.v1.watermarking.gpu_sampler import GPUWatermarkSampler
 from vllm.v1.watermarking.spec_decode import WatermarkedRejectionSampler
 from vllm.v1.worker.block_table import get_block_table_width
@@ -467,10 +467,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 "reasoning_config": self.vllm_config.reasoning_config,
                 "return_sampling_mask": self.model_config.return_sampling_mask,
             }
+            watermark_scheme = None
             if self.vllm_config.watermark_config is None:
                 self.sampler = Sampler(**sampler_kwargs)
             else:
-                watermarker = create_watermarker(self.vllm_config.watermark_config)
+                watermark_scheme = create_watermark_scheme(
+                    self.vllm_config.watermark_config
+                )
+                watermarker = watermark_scheme.watermarker_for()
                 self.sampler = GPUWatermarkSampler(watermarker, **sampler_kwargs)
             custom = self.model_state.custom_sampler(self.sampler)
 
@@ -484,11 +488,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     )
                 else:
                     assert isinstance(self.sampler, GPUWatermarkSampler)
+                    assert watermark_scheme is not None
+                    speculative_policy = watermark_scheme.speculative_policy
+                    assert speculative_policy is not None
                     self.rejection_sampler = WatermarkedRejectionSampler(
                         self.sampler,
                         self.speculative_config,
                         self.device,
-                        self.vllm_config.watermark_config,
+                        watermark_scheme.watermarker_for(
+                            speculative_policy.target_role
+                        ),
+                        speculative_policy,
                     )
             self.prompt_logprobs_worker = PromptLogprobsWorker(
                 self.max_num_reqs,

@@ -73,21 +73,6 @@ class GumbelWatermarker(Watermarker):
         return WatermarkSample(torch.argmax(logits + noise, dim=-1), logits)
 
 
-class DualKeyGumbelWatermarker(GumbelWatermarker):
-    supports_speculative_decoding = True
-
-    def __init__(
-        self,
-        key: int,
-        context_width: int = 4,
-        prf: WatermarkPRF | WatermarkPRFName = "philox",
-        *,
-        is_drafting: bool = False,
-    ) -> None:
-        domain = b"draft" if is_drafting else b"target"
-        super().__init__(derive_watermark_key(key, domain), context_width, prf)
-
-
 class GumbelWatermarkDetector(WatermarkDetector):
     def __init__(
         self,
