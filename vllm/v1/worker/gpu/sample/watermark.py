@@ -56,8 +56,10 @@ def _repeated_context_mask_kernel(
     CONTEXT_WIDTH: tl.constexpr,
     CONTEXT_BLOCK: tl.constexpr,
     BLOCK: tl.constexpr,
+    PROGRAMS_PER_REQ: tl.constexpr,
 ):
     row = tl.program_id(0).to(tl.int64)
+    chunk = tl.program_id(1)
     req_idx = tl.load(req_indices_ptr + row).to(tl.int64)
     valid_req = req_idx >= 0
     safe_req_idx = tl.maximum(req_idx, 0)
@@ -73,7 +75,7 @@ def _repeated_context_mask_kernel(
         other=-1,
     )
     repeated = tl.full((), 0, tl.int32)
-    for block_start in tl.range(0, output_len, BLOCK):
+    for block_start in tl.range(chunk * BLOCK, output_len, BLOCK * PROGRAMS_PER_REQ):
         previous_output_pos = block_start + offsets
         matches = valid_req & (previous_output_pos < output_len)
         for offset in range(CONTEXT_WIDTH):
@@ -81,17 +83,27 @@ def _repeated_context_mask_kernel(
                 tl.where(context_offsets == offset, context_tokens, 0), axis=0
             )
             historical_pos = previous_output_pos + offset - CONTEXT_WIDTH
+            load_mask = valid_req & (historical_pos >= 0)
+            if PROGRAMS_PER_REQ > 1:
+                load_mask &= previous_output_pos < output_len
             historical_token = tl.load(
                 all_token_ids_ptr
                 + safe_req_idx * all_token_ids_stride
                 + prompt_len
                 + tl.maximum(historical_pos, 0),
-                mask=valid_req & (historical_pos >= 0),
+                mask=load_mask,
                 other=-1,
             )
             matches &= historical_token == context_token
         repeated |= tl.max(matches.to(tl.int32), axis=0)
-    tl.store(output_ptr + row, repeated)
+    # Programs can update the same request or different bytes of the same word;
+    # atomic OR preserves every match without overwriting another program's result.
+    tl.atomic_or(
+        output_ptr.to(tl.pointer_type(tl.int32)) + row // 4,
+        1 << ((row % 4).to(tl.int32) * 8),
+        mask=repeated != 0,
+        sem="relaxed",
+    )
 
 
 def _repeated_context_mask_cpu(
@@ -119,6 +131,26 @@ def _repeated_context_mask_cpu(
     return repeated
 
 
+def _repeated_context_grid(num_reqs: int, token_capacity: int) -> tuple[int, int]:
+    """Select (requests, programs per request) for the history scan.
+
+    With sufficient token capacity:
+        n=1  -> (1, 32)
+        n=16 -> (16, 8)
+        n=32 -> (32, 4)
+        n=64 -> (64, 2)
+        n=65 -> (65, 1)
+
+    Batches of 65 or more use one program per request. Smaller batches split
+    each request across at most 32 programs, capped by the number of 512-token
+    blocks in the allocated token capacity.
+    """
+    programs_per_req = max(
+        1, min(32, 128 // max(1, num_reqs), triton.cdiv(token_capacity, 512))
+    )
+    return num_reqs, programs_per_req
+
+
 def repeated_context_mask(
     all_token_ids: torch.Tensor,
     req_indices: torch.Tensor,
@@ -137,8 +169,15 @@ def repeated_context_mask(
 
     if contexts.stride(-1) != 1:
         contexts = contexts.contiguous()
-    repeated = torch.empty(len(req_indices), dtype=torch.bool, device=contexts.device)
-    _repeated_context_mask_kernel[(len(req_indices),)](
+    if len(req_indices) == 0:
+        return torch.empty(0, dtype=torch.bool, device=contexts.device)
+    grid = _repeated_context_grid(len(req_indices), all_token_ids.shape[1])
+    programs_per_req = grid[1]
+    # Pad to whole atomic words; each int32 word contains four boolean bytes.
+    repeated = torch.zeros(
+        triton.cdiv(len(req_indices), 4) * 4, dtype=torch.bool, device=contexts.device
+    )
+    _repeated_context_mask_kernel[grid](
         repeated,
         all_token_ids,
         all_token_ids.stride(0),
@@ -150,8 +189,9 @@ def repeated_context_mask(
         CONTEXT_WIDTH=contexts.shape[-1],
         CONTEXT_BLOCK=triton.next_power_of_2(contexts.shape[-1]),
         BLOCK=512,
+        PROGRAMS_PER_REQ=programs_per_req,
     )
-    return repeated
+    return repeated[: len(req_indices)]
 
 
 @triton.jit
