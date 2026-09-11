@@ -1,0 +1,13 @@
+[
+  {
+    "_benchmark_name": "mtp_without_watermarking"
+  },
+  {
+    "_benchmark_name": "mtp_with_watermarking",
+    "watermark_config": {
+      "algorithm": "dual_key_gumbel",
+      "key": 42,
+      "context_width": 4
+    }
+  }
+]
