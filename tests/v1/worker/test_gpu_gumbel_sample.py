@@ -299,8 +299,9 @@ def _float_bits(t: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize("per_token_col", [False, True])
+@pytest.mark.parametrize("watermark", [False, True])
 def test_logits_cache_stores_input_logits_bitwise(
-    dtype: torch.dtype, per_token_col: bool
+    dtype: torch.dtype, per_token_col: bool, watermark: bool
 ):
     """`logits_cache` must receive the input logits, pre-temperature and bit-exact.
 
@@ -332,6 +333,16 @@ def test_logits_cache_stores_input_logits_bitwise(
     else:
         cols = torch.tensor(1, dtype=torch.int32, device=DEVICE)
 
+    watermark_kwargs = {}
+    if watermark:
+        watermark_kwargs = {
+            "contexts": torch.zeros(num_reqs, 4, dtype=torch.int64, device=DEVICE),
+            "watermarking": idx_mapping % 2 == 0,
+            "watermark_keys": torch.tensor([[42, 0]], device=DEVICE).expand(
+                num_reqs, -1
+            ),
+        }
+
     gumbel_sample(
         logits,
         idx_mapping,
@@ -342,6 +353,7 @@ def test_logits_cache_stores_input_logits_bitwise(
         is_drafting=True,
         logits_cache=cache,
         logits_cache_col=cols,
+        **watermark_kwargs,
     )
 
     if per_token_col:

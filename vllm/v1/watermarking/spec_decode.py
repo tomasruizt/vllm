@@ -29,33 +29,19 @@ class DraftWatermarker:
             device=device,
         )
         self.enabled = torch.zeros(max_num_reqs, dtype=torch.bool, device=device)
+        key = _resolve_watermark_key(watermarker)
+        self.keys = torch.tensor(
+            [[key & 0xFFFFFFFF, key >> 32]], dtype=torch.int64, device=device
+        )
 
     def prepare(self, contexts: torch.Tensor, enabled: torch.Tensor) -> None:
         num_reqs = contexts.shape[0]
         self.contexts[:num_reqs].copy_(contexts)
         self.enabled[:num_reqs].copy_(enabled)
 
-    def sample(
-        self,
-        logits: torch.Tensor,
-        ordinary_sampled: torch.Tensor,
-        idx_mapping: torch.Tensor,
-        temperature: torch.Tensor,
-    ) -> torch.Tensor:
-        request_temperatures = temperature[idx_mapping]
-        processed_logits = logits / torch.where(
-            request_temperatures == 0, 1, request_temperatures
-        ).unsqueeze(-1)
-        watermarked = self.watermarker.sample(
-            processed_logits,
-            self.contexts[: logits.shape[0]],
-            lambda _: ordinary_sampled,
-        ).token_ids
-        enabled = self.enabled[: logits.shape[0]] & (request_temperatures != 0)
-        sampled = torch.where(enabled, watermarked, ordinary_sampled)
-        contexts = self.contexts[: logits.shape[0]]
+    def advance(self, sampled: torch.Tensor) -> None:
+        contexts = self.contexts[: sampled.shape[0]]
         contexts.copy_(torch.cat((contexts[:, 1:], sampled.unsqueeze(-1)), dim=-1))
-        return sampled
 
 
 def create_speculative_target_watermarker(watermarker: Watermarker) -> Watermarker:

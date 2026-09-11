@@ -405,16 +405,22 @@ class DraftModelSpeculator(BaseSpeculator):
                 logits_cache=draft_logits,
                 logits_cache_col=draft_step,
                 use_fp64=self.use_fp64_gumbel,
+                **self._watermarking_kwargs(logits.shape[0]),
             )
             if self.draft_watermarker is not None:
-                sampled = self.draft_watermarker.sample(
-                    logits,
-                    sampled,
-                    idx_mapping,
-                    temperature,
-                )
+                self.draft_watermarker.advance(sampled)
             return sampled
         return self._greedy_sample_draft(hidden_states)
+
+    def _watermarking_kwargs(self, num_tokens: int) -> dict[str, torch.Tensor]:
+        state = self.draft_watermarker
+        if state is None:
+            return {}
+        return {
+            "contexts": state.contexts[:num_tokens],
+            "watermarking": state.enabled[:num_tokens],
+            "watermark_keys": state.keys.expand(num_tokens, -1),
+        }
 
     def prepare_watermarking(
         self, contexts: torch.Tensor, watermarking: torch.Tensor

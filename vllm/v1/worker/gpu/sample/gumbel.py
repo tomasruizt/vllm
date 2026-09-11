@@ -3,6 +3,7 @@
 import torch
 
 from vllm.triton_utils import HAS_TRITON, tl, tldevice, triton
+from vllm.v1.worker.gpu.sample.watermark import philox_gumbel_block_argmax
 
 # Smallest positive value produced by Triton's fp32 `tl.rand`. Used to clamp
 # zero draws before the flipped Gumbel transform below.
@@ -131,26 +132,46 @@ def gumbel_noised_argmax(
 
 
 @triton.jit
-def gumbel_block_argmax(
-    logits,
-    block,
-    mask,
-    token_idx,
-    expanded_idx_mapping_ptr,
-    temp_ptr,
-    seeds_ptr,
-    pos_ptr,
+def _gumbel_sample_kernel(
+    local_argmax_ptr,
+    local_argmax_stride,
+    local_max_ptr,
+    local_max_stride,
     # [max_num_reqs, num_cols, vocab_size]
     logits_cache_ptr,
     logits_cache_stride_0,
     logits_cache_stride_1,
     logits_cache_col_ptr,
+    logits_ptr,
+    logits_stride,
+    expanded_idx_mapping_ptr,
+    seeds_ptr,
+    pos_ptr,
+    temp_ptr,
     vocab_size,
+    BLOCK_SIZE: tl.constexpr,
     IS_DRAFTING: tl.constexpr,
     APPLY_TEMPERATURE: tl.constexpr,
     USE_FP64: tl.constexpr,
-    PER_TOKEN_COL: tl.constexpr = False,
+    PER_TOKEN_COL: tl.constexpr,
+    contexts_ptr,
+    contexts_stride,
+    watermarking_ptr,
+    watermark_keys_ptr,
+    watermark_keys_stride,
+    CONTEXT_WIDTH: tl.constexpr,
 ):
+    token_idx = tl.program_id(0).to(tl.int64)
+    block_idx = tl.program_id(1)
+    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = block < vocab_size
+    logits = tl.load(
+        logits_ptr + token_idx * logits_stride + block,
+        mask=mask,
+        other=float("-inf"),
+    )
+    logits = logits.to(tl.float32)
+
     req_state_idx = tl.load(expanded_idx_mapping_ptr + token_idx).to(tl.int64)
     is_valid_req = req_state_idx >= 0
     temp = tl.load(temp_ptr + req_state_idx, mask=is_valid_req, other=0.0).to(
@@ -174,75 +195,39 @@ def gumbel_block_argmax(
             mask=mask & is_valid_req,
         )
 
-    seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
-    pos = tl.load(pos_ptr + token_idx)
-    return gumbel_noised_argmax(
-        logits,
-        block,
-        mask,
-        seed,
-        pos,
-        temp,
-        IS_DRAFTING=IS_DRAFTING,
-        USE_FP64=USE_FP64,
-        APPLY_TEMPERATURE=APPLY_TEMPERATURE,
-    )
-
-
-@triton.jit
-def _gumbel_sample_kernel(
-    local_argmax_ptr,
-    local_argmax_stride,
-    local_max_ptr,
-    local_max_stride,
-    # [max_num_reqs, num_cols, vocab_size]
-    logits_cache_ptr,
-    logits_cache_stride_0,
-    logits_cache_stride_1,
-    logits_cache_col_ptr,
-    logits_ptr,
-    logits_stride,
-    expanded_idx_mapping_ptr,
-    seeds_ptr,
-    pos_ptr,
-    temp_ptr,
-    vocab_size,
-    BLOCK_SIZE: tl.constexpr,
-    IS_DRAFTING: tl.constexpr,
-    APPLY_TEMPERATURE: tl.constexpr,
-    USE_FP64: tl.constexpr,
-    PER_TOKEN_COL: tl.constexpr,
-):
-    token_idx = tl.program_id(0).to(tl.int64)
-    block_idx = tl.program_id(1)
-    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    mask = block < vocab_size
-    logits = tl.load(
-        logits_ptr + token_idx * logits_stride + block,
-        mask=mask,
-        other=float("-inf"),
-    )
-    logits = logits.to(tl.float32)
-
-    value, idx = gumbel_block_argmax(
-        logits,
-        block,
-        mask,
-        token_idx,
-        expanded_idx_mapping_ptr,
-        temp_ptr,
-        seeds_ptr,
-        pos_ptr,
-        logits_cache_ptr,
-        logits_cache_stride_0,
-        logits_cache_stride_1,
-        logits_cache_col_ptr,
-        vocab_size,
-        IS_DRAFTING=IS_DRAFTING,
-        APPLY_TEMPERATURE=APPLY_TEMPERATURE,
-        USE_FP64=USE_FP64,
-        PER_TOKEN_COL=PER_TOKEN_COL,
-    )
+    is_watermarked = False
+    if contexts_ptr is not None:
+        is_watermarked = tl.load(watermarking_ptr + token_idx) & is_valid_req
+    if contexts_ptr is not None and is_watermarked and temp != 0.0:
+        if APPLY_TEMPERATURE:
+            logits = logits / temp
+        key_ptr = watermark_keys_ptr + token_idx * watermark_keys_stride
+        watermark_value, idx = philox_gumbel_block_argmax(
+            logits,
+            mask,
+            block_idx,
+            contexts_ptr + token_idx * contexts_stride,
+            tl.load(key_ptr).to(tl.uint32),
+            tl.load(key_ptr + 1).to(tl.uint32),
+            CONTEXT_WIDTH,
+            BLOCK_SIZE,
+        )
+        # The keyed draw stays fp32, even when ordinary sampling uses fp64.
+        value = watermark_value.to(tl.float64) if USE_FP64 else watermark_value
+    else:
+        seed = tl.load(seeds_ptr + req_state_idx, mask=is_valid_req, other=0)
+        pos = tl.load(pos_ptr + token_idx)
+        value, idx = gumbel_noised_argmax(
+            logits,
+            block,
+            mask,
+            seed,
+            pos,
+            temp,
+            IS_DRAFTING=IS_DRAFTING,
+            USE_FP64=USE_FP64,
+            APPLY_TEMPERATURE=APPLY_TEMPERATURE,
+        )
     token_id = block_idx * BLOCK_SIZE + idx
     tl.store(local_argmax_ptr + token_idx * local_argmax_stride + block_idx, token_id)
     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
@@ -259,6 +244,10 @@ def gumbel_sample(
     logits_cache: torch.Tensor | None = None,  # [max_num_reqs, num_cols, vocab_size]
     logits_cache_col: torch.Tensor | None = None,  # scalar or [num_tokens]
     use_fp64: bool = False,
+    *,
+    contexts: torch.Tensor | None = None,  # [num_tokens, context_width]
+    watermarking: torch.Tensor | None = None,  # [num_tokens]
+    watermark_keys: torch.Tensor | None = None,  # [num_tokens, 2], low/high words
 ) -> torch.Tensor:
     # Enforce contiguity on non-strided input tensors
     expanded_idx_mapping = expanded_idx_mapping.contiguous()
@@ -266,6 +255,17 @@ def gumbel_sample(
     if logits_cache_col is not None:
         logits_cache_col = logits_cache_col.contiguous()
     num_tokens, vocab_size = logits.shape
+    if contexts is not None:
+        assert contexts.shape[0] == num_tokens
+        assert watermarking is not None and watermarking.shape == (num_tokens,)
+        assert watermark_keys is not None and watermark_keys.shape == (num_tokens, 2)
+        if contexts.stride(-1) != 1:
+            contexts = contexts.contiguous()
+        if watermark_keys.stride(-1) != 1:
+            watermark_keys = watermark_keys.contiguous()
+        watermarking = watermarking.contiguous()
+    else:
+        assert watermarking is None and watermark_keys is None
     if logits_cache is not None:
         assert logits_cache.size(-1) >= vocab_size, (
             f"draft logits cache vocab dim ({logits_cache.size(-1)}) is narrower "
@@ -299,6 +299,14 @@ def gumbel_sample(
         APPLY_TEMPERATURE=apply_temperature,
         USE_FP64=use_fp64,
         PER_TOKEN_COL=per_token_col,
+        contexts_ptr=contexts,
+        contexts_stride=contexts.stride(0) if contexts is not None else 0,
+        watermarking_ptr=watermarking,
+        watermark_keys_ptr=watermark_keys,
+        watermark_keys_stride=watermark_keys.stride(0)
+        if watermark_keys is not None
+        else 0,
+        CONTEXT_WIDTH=contexts.shape[1] if contexts is not None else 0,
     )
     # NOTE(woosuk): Use int64 for later indexing.
     max_block_idx = local_max.argmax(dim=-1, keepdim=True)

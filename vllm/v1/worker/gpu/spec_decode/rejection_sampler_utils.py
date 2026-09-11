@@ -3,7 +3,7 @@
 import torch
 
 from vllm.triton_utils import tl, tldevice, triton
-from vllm.v1.worker.gpu.sample.gumbel import gumbel_block_argmax, tl_rand32
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax, tl_rand32
 from vllm.v1.worker.gpu.sample.watermark import philox_gumbel_block_argmax
 
 
@@ -693,40 +693,6 @@ def _rejection_kernel(
     tl.store(draft_rejected_logsumexp_ptr + req_idx, draft_lse)
 
 
-@triton.jit
-def _seeded_resample_argmax(
-    residual_logits,
-    block,
-    mask,
-    resample_token_idx,
-    expanded_idx_mapping_ptr,
-    temp_ptr,
-    seed_ptr,
-    pos_ptr,
-    vocab_size,
-    USE_FP64: tl.constexpr,
-):
-    """Stock (unwatermarked) Gumbel-max draw over one residual vocab block."""
-    return gumbel_block_argmax(
-        residual_logits,
-        block,
-        mask,
-        resample_token_idx,
-        expanded_idx_mapping_ptr,
-        temp_ptr,
-        seed_ptr,
-        pos_ptr,
-        None,  # logits_cache_ptr
-        0,  # logits_cache_stride_0
-        0,  # logits_cache_stride_1
-        None,  # logits_cache_col_ptr
-        vocab_size,
-        IS_DRAFTING=False,
-        APPLY_TEMPERATURE=False,
-        USE_FP64=USE_FP64,
-    )
-
-
 @triton.jit(do_not_specialize=["watermark_key_0", "watermark_key_1"])
 def _resample_kernel(
     # [num_reqs, num_blocks]
@@ -869,10 +835,8 @@ def _resample_kernel(
     # Resample the rejected/bonus token. Watermarked requests draw the token
     # from the same residual with keyed Philox noise instead of the request's
     # seeded noise; everything else keeps the stock draw bit-for-bit.
+    is_watermarked = False
     if WATERMARK:
-        # A padded row (req_state_idx == -1) has no watermark state; fall back
-        # to the stock draw. Greedy rows are never watermarked, matching the
-        # unsped path.
         is_watermarked = (
             tl.load(
                 watermarking_ptr + req_state_idx,
@@ -881,44 +845,32 @@ def _resample_kernel(
             )
             != 0
         )
-        if is_watermarked & (temp != 0.0):
-            watermark_value, idx = philox_gumbel_block_argmax(
-                residual_logits,
-                mask,
-                block_idx,
-                contexts_ptr + resample_token_idx * contexts_stride,
-                watermark_key_0.to(tl.uint32),
-                watermark_key_1.to(tl.uint32),
-                CONTEXT_WIDTH,
-                BLOCK_SIZE,
-            )
-            # USE_FP64 must not change the keyed draw (the detector's uniform
-            # is fp32); upcast only so both branches yield one dtype.
-            value = watermark_value.to(tl.float64) if USE_FP64 else watermark_value
-        else:
-            value, idx = _seeded_resample_argmax(
-                residual_logits,
-                block,
-                mask,
-                resample_token_idx,
-                expanded_idx_mapping_ptr,
-                temp_ptr,
-                seed_ptr,
-                pos_ptr,
-                vocab_size,
-                USE_FP64=USE_FP64,
-            )
+    if WATERMARK and is_watermarked and temp != 0.0:
+        watermark_value, idx = philox_gumbel_block_argmax(
+            residual_logits,
+            mask,
+            block_idx,
+            contexts_ptr + resample_token_idx * contexts_stride,
+            watermark_key_0.to(tl.uint32),
+            watermark_key_1.to(tl.uint32),
+            CONTEXT_WIDTH,
+            BLOCK_SIZE,
+        )
+        # Keep the keyed draw in fp32 regardless of ordinary sampling precision.
+        value = watermark_value.to(tl.float64) if USE_FP64 else watermark_value
     else:
-        value, idx = _seeded_resample_argmax(
+        is_valid_req = req_state_idx >= 0
+        seed = tl.load(seed_ptr + req_state_idx, mask=is_valid_req, other=0)
+        pos = tl.load(pos_ptr + resample_token_idx)
+        value, idx = gumbel_noised_argmax(
             residual_logits,
             block,
             mask,
-            resample_token_idx,
-            expanded_idx_mapping_ptr,
-            temp_ptr,
-            seed_ptr,
-            pos_ptr,
-            vocab_size,
+            seed,
+            pos,
+            tl.where(is_valid_req, temp, 0.0),
+            IS_DRAFTING=False,
+            APPLY_TEMPERATURE=False,
             USE_FP64=USE_FP64,
         )
     token_id = block_idx * BLOCK_SIZE + idx

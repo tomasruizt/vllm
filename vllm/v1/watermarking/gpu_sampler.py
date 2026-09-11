@@ -1,12 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from functools import partial
+
 import numpy as np
 import torch
 
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p
+from vllm.v1.watermarking.gumbel import DualKeyGumbelWatermarker, GumbelWatermarker
+from vllm.v1.watermarking.prfs import PhiloxPRF
 from vllm.v1.watermarking.watermarker import Watermarker
 from vllm.v1.worker.gpu.buffer_utils import UvaBackedTensor
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
@@ -29,6 +33,32 @@ class GPUWatermarkSampler(Sampler):
         )
         self.watermarking.np.fill(True)
         self.watermarking.copy_to_uva()
+
+        watermark_roles = [watermarker]
+        self.watermark_routing_logits: torch.Tensor | None = None
+        if isinstance(watermarker, DualKeyGumbelWatermarker):
+            watermark_roles = [
+                watermarker.draft_watermarker,
+                watermarker.target_watermarker,
+            ]
+            if watermarker.alpha in (0, 1):
+                watermark_roles = [watermark_roles[int(watermarker.alpha)]]
+            else:
+                self.watermark_routing_logits = torch.tensor(
+                    [1 - watermarker.alpha, watermarker.alpha],
+                    dtype=torch.float32,
+                    device=self.watermarking.gpu.device,
+                ).log()
+        keys = []
+        for role in watermark_roles:
+            assert isinstance(role, GumbelWatermarker)
+            assert type(role.prf) is PhiloxPRF
+            keys.append(role.prf.key)
+        self.watermark_keys = torch.tensor(
+            [[key & 0xFFFFFFFF, key >> 32] for key in keys],
+            dtype=torch.int64,
+            device=self.watermarking.gpu.device,
+        )
 
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
@@ -71,44 +101,29 @@ class GPUWatermarkSampler(Sampler):
             )
 
         processed_logits = apply_top_k_top_p(processed_logits, top_k, top_p)
-        contexts = self._get_contexts(expanded_idx_mapping)
-
-        def random_sample(sample_logits: torch.Tensor) -> torch.Tensor:
-            return gumbel_sample(
-                sample_logits,
-                expanded_idx_mapping,
-                self.sampling_states.temperature.gpu,
-                self.sampling_states.seeds.gpu,
-                pos,
-                apply_temperature=False,
-                is_drafting=False,
-                use_fp64=self.use_fp64_gumbel,
-            )
-
-        output = self.watermarker.sample(
-            processed_logits,
-            contexts,
-            random_sample,
+        random_sample = partial(
+            gumbel_sample,
+            expanded_idx_mapping=expanded_idx_mapping,
+            temperature=self.sampling_states.temperature.gpu,
+            seed=self.sampling_states.seeds.gpu,
+            pos=pos,
+            apply_temperature=False,
+            is_drafting=False,
+            use_fp64=self.use_fp64_gumbel,
         )
-        temperatures = self.sampling_states.temperature.gpu[expanded_idx_mapping]
-        watermarking = self.watermarking.gpu[expanded_idx_mapping] & (temperatures != 0)
-        if not np.all(enabled):
-            unwatermarked = random_sample(processed_logits)
-            sampled = torch.where(watermarking, output.token_ids, unwatermarked)
-            output_logits = output.logits
-            if output.logits is not processed_logits:
-                output_logits = torch.where(
-                    watermarking.unsqueeze(-1), output.logits, processed_logits
-                )
+        num_tokens = processed_logits.shape[0]
+        if self.watermark_routing_logits is None:
+            keys = self.watermark_keys.expand(num_tokens, -1)
         else:
-            sampled = output.token_ids
-            output_logits = output.logits
-        sampled = torch.where(
-            temperatures == 0,
-            processed_logits.argmax(dim=-1),
-            sampled,
+            routing_logits = self.watermark_routing_logits.expand(num_tokens, -1)
+            keys = self.watermark_keys[random_sample(routing_logits)]
+        sampled = random_sample(
+            processed_logits,
+            contexts=self._get_contexts(expanded_idx_mapping),
+            watermarking=self.watermarking.gpu[expanded_idx_mapping],
+            watermark_keys=keys,
         )
-        return sampled, output_logits
+        return sampled, processed_logits
 
     def _get_contexts(
         self,

@@ -148,14 +148,10 @@ class DSparkSpeculator(DFlashSpeculator):
             logits_cache=self.draft_logits,
             logits_cache_col=self._step_cols[step],
             use_fp64=self.use_fp64_gumbel,
+            **self._watermarking_kwargs(logits.shape[0]),
         )
         if self.draft_watermarker is not None:
-            sampled = self.draft_watermarker.sample(
-                logits,
-                sampled,
-                idx_map,
-                self.temperature,
-            )
+            self.draft_watermarker.advance(sampled)
         return sampled
 
     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
