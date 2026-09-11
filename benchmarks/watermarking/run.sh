@@ -6,6 +6,7 @@ set -euo pipefail
 # Run from the repository root with its vLLM environment activated.
 # Append --dry-run to preview the commands without starting a server.
 export VLLM_USE_V2_MODEL_RUNNER=1
+PORT=${PORT:-18000}
 
 vllm bench sweep serve \
   --serve-cmd 'vllm serve Qwen/Qwen3.5-9B
@@ -13,7 +14,7 @@ vllm bench sweep serve \
     --max-model-len 4096
     --no-enable-prefix-caching
     --generation-config vllm
-    --speculative-config {\"method\":\"mtp\",\"num_speculative_tokens\":3,\"draft_sample_method\":\"probabilistic\"}' \
+    --speculative-config {\"method\":\"mtp\",\"num_speculative_tokens\":3,\"draft_sample_method\":\"probabilistic\"}'" --port $PORT" \
   --bench-cmd 'vllm bench serve
     --model Qwen/Qwen3.5-9B
     --backend vllm --endpoint /v1/completions
@@ -21,9 +22,9 @@ vllm bench sweep serve \
     --hf-subset main --hf-split test --hf-output-len 512
     --num-prompts 200 --num-warmups 8
     --max-concurrency 8 --request-rate inf
-    --temperature 1 --ignore-eos --seed 42' \
+    --temperature 1 --ignore-eos --seed 42'" --port $PORT" \
   --serve-params benchmarks/watermarking/serve_params.json \
-  --num-runs 3 \
+  --num-runs 10 \
   --server-ready-timeout 1200 \
   --output-dir benchmarks/watermarking/results \
   "$@"
