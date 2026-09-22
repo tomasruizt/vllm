@@ -17,6 +17,7 @@ from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.attn_utils import (
+    GDNCommonMetadata,
     build_attn_metadata,
     compute_common_gdn_attn_metadata,
 )
@@ -37,20 +38,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
-    num_prefills: int = 0
-    num_prefill_tokens: int = 0
-    num_decodes: int = 0
-    num_decode_tokens: int = 0
-    num_spec_decodes: int = 0
-    num_spec_decode_tokens: int = 0
-    spec_query_start_loc: torch.Tensor | None = None
-    non_spec_query_start_loc: torch.Tensor | None = None
-    non_spec_query_start_loc_cpu: torch.Tensor | None = None
-    spec_sequence_masks_cpu: torch.Tensor | None = None
-    spec_sequence_masks: torch.Tensor | None = None
-    non_spec_sequence_masks_cpu: torch.Tensor | None = None
-    spec_token_indx: torch.Tensor | None = None
-    non_spec_token_indx: torch.Tensor | None = None
+    gdn_metadata: GDNCommonMetadata | None = None
 
     def get_extra_common_attn_kwargs(
         self,
@@ -64,6 +52,11 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
         attn_metadata_builder: Any,
         num_reqs: int,
     ) -> dict[str, Any]:
+        if (
+            isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder)
+            and self.gdn_metadata is not None
+        ):
+            return {"gdn_metadata": self.gdn_metadata}
         if not isinstance(
             attn_metadata_builder,
             (
@@ -80,26 +73,6 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             "num_decode_draft_tokens_cpu": None
             if self.num_decode_draft_tokens_cpu is None
             else self.num_decode_draft_tokens_cpu[:num_reqs],
-            "spec_sequence_masks_cpu": None
-            if self.spec_sequence_masks_cpu is None
-            else self.spec_sequence_masks_cpu[:num_reqs],
-            "spec_sequence_masks": None
-            if self.spec_sequence_masks is None
-            else self.spec_sequence_masks[:num_reqs],
-            "non_spec_sequence_masks_cpu": None
-            if self.non_spec_sequence_masks_cpu is None
-            else self.non_spec_sequence_masks_cpu[:num_reqs],
-            "num_prefills": self.num_prefills,
-            "num_prefill_tokens": self.num_prefill_tokens,
-            "num_decodes": self.num_decodes,
-            "num_decode_tokens": self.num_decode_tokens,
-            "num_spec_decodes": self.num_spec_decodes,
-            "num_spec_decode_tokens": self.num_spec_decode_tokens,
-            "spec_query_start_loc": self.spec_query_start_loc,
-            "non_spec_query_start_loc": self.non_spec_query_start_loc,
-            "non_spec_query_start_loc_cpu": self.non_spec_query_start_loc_cpu,
-            "spec_token_indx": self.spec_token_indx,
-            "non_spec_token_indx": self.non_spec_token_indx,
         }
 
 
@@ -296,20 +269,7 @@ class MambaHybridModelState(DefaultModelState):
         # compute them during actual (non-capture) forward execution.
         num_accepted_tokens = None
         num_decode_draft_tokens_cpu = None
-        num_prefills = 0
-        num_prefill_tokens = 0
-        num_decodes = 0
-        num_decode_tokens = 0
-        num_spec_decodes = 0
-        num_spec_decode_tokens = 0
-        spec_query_start_loc = None
-        non_spec_query_start_loc = None
-        non_spec_query_start_loc_cpu = None
-        spec_sequence_masks_cpu = None
-        spec_sequence_masks = None
-        non_spec_sequence_masks_cpu = None
-        spec_token_indx = None
-        non_spec_token_indx = None
+        gdn_metadata = None
         if not for_capture:
             if self.vllm_config.num_speculative_tokens > 0:
                 num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
@@ -337,23 +297,7 @@ class MambaHybridModelState(DefaultModelState):
 
             # Compute GDN common metadata
             if self.is_gdn(attn_groups):
-                (
-                    num_prefills,
-                    num_prefill_tokens,
-                    num_decodes,
-                    num_decode_tokens,
-                    num_spec_decodes,
-                    num_spec_decode_tokens,
-                    spec_query_start_loc,
-                    non_spec_query_start_loc,
-                    non_spec_query_start_loc_cpu,
-                    spec_sequence_masks_cpu,
-                    spec_sequence_masks,
-                    non_spec_sequence_masks_cpu,
-                    spec_token_indx,
-                    non_spec_token_indx,
-                    num_accepted_tokens,
-                ) = compute_common_gdn_attn_metadata(
+                gdn_metadata = compute_common_gdn_attn_metadata(
                     num_decode_draft_tokens_cpu,
                     num_accepted_tokens,
                     input_batch.query_start_loc,
@@ -383,20 +327,7 @@ class MambaHybridModelState(DefaultModelState):
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
-            num_prefills=num_prefills,
-            num_prefill_tokens=num_prefill_tokens,
-            num_decodes=num_decodes,
-            num_decode_tokens=num_decode_tokens,
-            num_spec_decodes=num_spec_decodes,
-            num_spec_decode_tokens=num_spec_decode_tokens,
-            spec_query_start_loc=spec_query_start_loc,
-            non_spec_query_start_loc=non_spec_query_start_loc,
-            non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
-            spec_sequence_masks_cpu=spec_sequence_masks_cpu,
-            spec_sequence_masks=spec_sequence_masks,
-            non_spec_sequence_masks_cpu=non_spec_sequence_masks_cpu,
-            spec_token_indx=spec_token_indx,
-            non_spec_token_indx=non_spec_token_indx,
+            gdn_metadata=gdn_metadata,
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,

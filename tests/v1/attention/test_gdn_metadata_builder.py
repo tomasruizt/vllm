@@ -5,7 +5,7 @@ reclassification of non-spec decodes as prefills when spec decodes exist.
 Covers the fix for https://github.com/vllm-project/vllm/issues/34845.
 """
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 
 import pytest
 import torch
@@ -156,6 +156,7 @@ def _build(
     builder: GDNAttentionMetadataBuilder,
     batch_spec: BatchSpec,
     num_decode_draft_tokens: list[int] | None = None,
+    precompute: bool = True,
 ) -> GDNAttentionMetadata:
     """Build GDN attention metadata, optionally with spec-decode kwargs."""
     common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
@@ -167,56 +168,28 @@ def _build(
         num_accepted_tokens = torch.ones(
             batch_spec.batch_size, dtype=torch.int32, device=DEVICE
         )
-        (
-            num_prefills,
-            num_prefill_tokens,
-            num_decodes,
-            num_decode_tokens,
-            num_spec_decodes,
-            num_spec_decode_tokens,
-            spec_query_start_loc,
-            non_spec_query_start_loc,
-            non_spec_query_start_loc_cpu,
-            spec_sequence_masks_cpu,
-            spec_sequence_masks,
-            non_spec_sequence_masks_cpu,
-            spec_token_indx,
-            non_spec_token_indx,
-            num_accepted_tokens,
-        ) = compute_common_gdn_attn_metadata(
-            num_decode_draft_tokens_cpu,
-            num_accepted_tokens,
+        kwargs["num_decode_draft_tokens_cpu"] = num_decode_draft_tokens_cpu
+        kwargs["num_accepted_tokens"] = num_accepted_tokens
+    if precompute:
+        kwargs["gdn_metadata"] = compute_common_gdn_attn_metadata(
+            kwargs.get("num_decode_draft_tokens_cpu"),
+            kwargs.get("num_accepted_tokens"),
             common.query_start_loc,
             common.query_start_loc_cpu,
             builder.num_spec,
         )
-        kwargs["num_decode_draft_tokens_cpu"] = num_decode_draft_tokens_cpu
-        kwargs["num_accepted_tokens"] = num_accepted_tokens
-        kwargs["num_prefills"] = num_prefills
-        kwargs["num_prefill_tokens"] = num_prefill_tokens
-        kwargs["num_decodes"] = num_decodes
-        kwargs["num_decode_tokens"] = num_decode_tokens
-        kwargs["num_spec_decodes"] = num_spec_decodes
-        kwargs["num_spec_decode_tokens"] = num_spec_decode_tokens
-        kwargs["spec_query_start_loc"] = spec_query_start_loc
-        kwargs["non_spec_query_start_loc"] = non_spec_query_start_loc
-        kwargs["non_spec_query_start_loc_cpu"] = non_spec_query_start_loc_cpu
-        kwargs["spec_sequence_masks_cpu"] = spec_sequence_masks_cpu
-        kwargs["spec_sequence_masks"] = spec_sequence_masks
-        kwargs["non_spec_sequence_masks_cpu"] = non_spec_sequence_masks_cpu
-        kwargs["spec_token_indx"] = spec_token_indx
-        kwargs["non_spec_token_indx"] = non_spec_token_indx
     return builder.build(common_prefix_len=0, common_attn_metadata=common, **kwargs)
 
 
 @pytest.mark.parametrize(
     "test_case", GDN_BUILD_TEST_CASES.values(), ids=GDN_BUILD_TEST_CASES.keys()
 )
-def test_gdn_build_classification(test_case: GDNBuildTestCase):
+@pytest.mark.parametrize("precompute", [False, True], ids=["fallback", "shared"])
+def test_gdn_build_classification(test_case: GDNBuildTestCase, precompute: bool):
     """Test that GDN metadata builder classifies requests correctly."""
     builder = _create_gdn_builder(test_case.num_speculative_tokens)
     batch = BatchSpec(seq_lens=test_case.seq_lens, query_lens=test_case.query_lens)
-    meta = _build(builder, batch, test_case.num_decode_draft_tokens)
+    meta = _build(builder, batch, test_case.num_decode_draft_tokens, precompute)
 
     assert meta.num_decodes == test_case.expected_num_decodes
     assert meta.num_prefills == test_case.expected_num_prefills
@@ -261,3 +234,31 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+
+def test_shared_metadata_keeps_group_state_indices_separate():
+    """Each group uses its own block table without modifying shared metadata."""
+    batch = BatchSpec(seq_lens=[64, 64], query_lens=[3, 3])
+    common = create_common_attn_metadata(
+        batch, BLOCK_SIZE, DEVICE, arange_block_indices=True
+    )
+    shared = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=torch.tensor([2, 2], dtype=torch.int32),
+        num_accepted_tokens=torch.tensor([1, 2], dtype=torch.int32),
+        query_start_loc=common.query_start_loc,
+        query_start_loc_cpu=common.query_start_loc_cpu,
+        num_spec=2,
+    )
+    snapshot = asdict(shared)
+
+    for offset in (0, 100):
+        builder = _create_gdn_builder(2, full_cuda_graph=True)
+        builder.vllm_config.cache_config.mamba_cache_mode = "none"
+        group = replace(common, block_table_tensor=common.block_table_tensor + offset)
+
+        metadata = builder.build(0, group, gdn_metadata=shared)
+
+        torch.testing.assert_close(
+            metadata.spec_state_indices_tensor, group.block_table_tensor[:, :3]
+        )
+        torch.testing.assert_close(asdict(shared), snapshot)

@@ -358,13 +358,34 @@ def compute_mm_prefix_ranges(
     return req_doc_ranges
 
 
+@dataclass(frozen=True)
+class GDNCommonMetadata:
+    """Group-independent metadata; consumers must not mutate its tensors."""
+
+    num_prefills: int
+    num_prefill_tokens: int
+    num_decodes: int
+    num_decode_tokens: int
+    num_spec_decodes: int
+    num_spec_decode_tokens: int
+    spec_query_start_loc: torch.Tensor | None
+    non_spec_query_start_loc: torch.Tensor | None
+    non_spec_query_start_loc_cpu: torch.Tensor | None
+    spec_sequence_masks_cpu: torch.Tensor | None
+    spec_sequence_masks: torch.Tensor | None
+    non_spec_sequence_masks_cpu: torch.Tensor | None
+    spec_token_indx: torch.Tensor | None
+    non_spec_token_indx: torch.Tensor | None
+    num_accepted_tokens: torch.Tensor | None
+
+
 def compute_common_gdn_attn_metadata(
-    num_decode_draft_tokens_cpu: torch.Tensor,
-    num_accepted_tokens: torch.Tensor,
+    num_decode_draft_tokens_cpu: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor | None,
     query_start_loc: torch.Tensor,
     query_start_loc_cpu: torch.Tensor,
     num_spec: int,
-) -> tuple[Any, ...]:
+) -> GDNCommonMetadata:
     """Compute the batch-level spec-decode metadata once per step.
 
     This metadata (masks, decode/prefill/spec split, token indices,
@@ -496,20 +517,20 @@ def compute_common_gdn_attn_metadata(
         assert num_accepted_tokens is not None
         num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
 
-    return (
-        num_prefills,
-        num_prefill_tokens,
-        num_decodes,
-        num_decode_tokens,
-        num_spec_decodes,
-        num_spec_decode_tokens,
-        spec_query_start_loc,
-        non_spec_query_start_loc,
-        non_spec_query_start_loc_cpu,
-        spec_sequence_masks_cpu,
-        spec_sequence_masks,
-        non_spec_sequence_masks_cpu,
-        spec_token_indx,
-        non_spec_token_indx,
-        num_accepted_tokens,
+    return GDNCommonMetadata(
+        num_prefills=num_prefills,
+        num_prefill_tokens=num_prefill_tokens,
+        num_decodes=num_decodes,
+        num_decode_tokens=num_decode_tokens,
+        num_spec_decodes=num_spec_decodes,
+        num_spec_decode_tokens=num_spec_decode_tokens,
+        spec_query_start_loc=spec_query_start_loc,
+        non_spec_query_start_loc=non_spec_query_start_loc,
+        non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
+        spec_sequence_masks_cpu=spec_sequence_masks_cpu,
+        spec_sequence_masks=spec_sequence_masks,
+        non_spec_sequence_masks_cpu=non_spec_sequence_masks_cpu,
+        spec_token_indx=spec_token_indx,
+        non_spec_token_indx=non_spec_token_indx,
+        num_accepted_tokens=num_accepted_tokens,
     )
