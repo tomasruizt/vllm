@@ -1445,6 +1445,35 @@ def test_pipeline_stages_resolve_common_kv_cache_layout(monkeypatch, stage_patte
     assert config.cache_config.kv_cache_layout == layout.name
 
 
+@pytest.mark.parametrize(
+    ("supported_layouts", "expected"),
+    [
+        ([["LBHNC", "BLHNC"], ["BLHNC", "LBHNC"]], "LBHNC"),
+        ([["LBHNC", "BLHNC"], ["BLHNC"]], "BLHNC"),
+    ],
+)
+def test_resolve_kv_cache_layout_intersection(monkeypatch, supported_layouts, expected):
+    """Use a common layout in first-worker order."""
+    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    config = _grouping_vllm_config()
+    config.cache_config.kv_cache_layout = None
+    config.kv_transfer_config = None
+
+    layout = resolve_kv_cache_layout(config, supported_layouts)
+    assert layout.name == expected
+    assert config.cache_config.kv_cache_layout == expected
+
+
+def test_resolve_kv_cache_layout_rejects_disjoint_layouts():
+    config = _grouping_vllm_config()
+    config.cache_config.kv_cache_layout = None
+
+    with pytest.raises(
+        ValueError, match="No KV cache layout is supported by every worker"
+    ):
+        resolve_kv_cache_layout(config, [["LBHNC"], ["BLHNC"]])
+
+
 def _attn_spec(num_kv_heads: int, sliding_window: int | None = None):
     kwargs = dict(
         block_size=640, num_kv_heads=num_kv_heads, head_size=128, dtype=torch.bfloat16
