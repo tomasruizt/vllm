@@ -26,14 +26,20 @@ from vllm.distributed.kv_transfer.kv_connector.v1.hisparse.worker import (
 )
 from vllm.model_executor.layers.mamba.mamba_mixer2 import MambaMixer2
 from vllm.v1.attention.backend import MultipleOf
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.hisparse.types import SparseKVPageTransfer, SparseKVRowMirror
-from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheLayout,
+    SlidingWindowSpec,
+)
 from vllm.v1.worker.utils import (
     _prefers_packed_kv_cache,
     bind_kv_cache,
     bind_kv_cache_to_layers,
     copy_kv_cache_blocks_inplace,
+    get_supported_kv_cache_layouts,
 )
 
 
@@ -1393,6 +1399,50 @@ def test_bind_kv_cache_draft_model(default_vllm_config):
     assert runner_kv_caches[1] is kv_cache["draft_model.layers.0.attn"]
     assert runner_kv_caches[2] is kv_cache["model.layers.1.attn"]
     assert runner_kv_caches[3] is kv_cache["draft_model.layers.1.attn"]
+
+
+@pytest.mark.parametrize(
+    "stage_patterns",
+    # Space separates PP stages 0 and 1; each character is a layer:
+    # F = full attention, S = sliding-window attention.
+    ["FSS FSS", "FFS FFS", "FSS FFS"],
+)
+def test_pipeline_stages_resolve_common_kv_cache_layout(monkeypatch, stage_patterns):
+    """Two stages with three layers each must resolve a common layout across mixes."""
+    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    backend = _backend(MultipleOf(16))
+    backend.supported_kv_cache_layouts = lambda: (
+        KVCacheLayout.LBHNC,
+        KVCacheLayout.BLHNC,
+    )
+
+    config = _grouping_vllm_config()
+    config.cache_config.kv_cache_layout = None
+    config.kv_transfer_config = None
+
+    full_attn = _attn_spec(num_kv_heads=2)
+    sliding_attn = _attn_spec(num_kv_heads=4, sliding_window=128)
+    specs_by_type = {"F": full_attn, "S": sliding_attn}
+    stage0, stage1 = stage_patterns.split()
+    stage0_specs = {
+        "stage.0.layer.0": specs_by_type[stage0[0]],
+        "stage.0.layer.1": specs_by_type[stage0[1]],
+        "stage.0.layer.2": specs_by_type[stage0[2]],
+    }
+    stage1_specs = {
+        "stage.1.layer.0": specs_by_type[stage1[0]],
+        "stage.1.layer.1": specs_by_type[stage1[1]],
+        "stage.1.layer.2": specs_by_type[stage1[2]],
+    }
+    supported_layouts = [
+        get_supported_kv_cache_layouts(config, [backend], stage0_specs),
+        get_supported_kv_cache_layouts(config, [backend], stage1_specs),
+    ]
+    all_specs = [*stage0_specs.values(), *stage1_specs.values()]
+
+    layout = resolve_kv_cache_layout(config, supported_layouts, all_specs)
+    assert all(layout.name in names for names in supported_layouts)
+    assert config.cache_config.kv_cache_layout == layout.name
 
 
 def _attn_spec(num_kv_heads: int, sliding_window: int | None = None):
