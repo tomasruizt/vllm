@@ -30,11 +30,11 @@ from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
 from vllm.v1.hisparse.types import SparseKVPageTransfer, SparseKVRowMirror
 from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 from vllm.v1.worker.utils import (
+    _prefers_packed_kv_cache,
     bind_kv_cache,
     bind_kv_cache_to_layers,
     copy_kv_cache_blocks_inplace,
 )
-from vllm.v1.worker.worker_base import WorkerBase
 
 
 def _make_hisparse_worker() -> HiSparseConnectorWorker:
@@ -1444,8 +1444,7 @@ _TARGET_SW = {
     ],
 )
 def test_prefers_packed_kv_cache(specs, kernel_block_sizes, expected):
-    worker = SimpleNamespace(
-        get_kv_cache_spec=lambda: specs, vllm_config=_grouping_vllm_config()
-    )
     backends = [_backend(*(kernel_block_sizes or (MultipleOf(16),)))]
-    assert WorkerBase._prefers_packed_kv_cache(worker, backends) is expected
+    assert (
+        _prefers_packed_kv_cache(_grouping_vllm_config(), backends, specs) is expected
+    )

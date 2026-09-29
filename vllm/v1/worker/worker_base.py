@@ -16,14 +16,10 @@ from vllm.multimodal.cache import worker_receiver_cache_from_config
 from vllm.tracing import instrument
 from vllm.utils.import_utils import resolve_obj_by_qualname
 from vllm.utils.system_utils import update_environment_variables
-from vllm.v1.attention.backends.utils import (
-    get_supported_kv_cache_layouts,
-    record_kv_cache_layout,
-)
-from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
+from vllm.v1.attention.backends.utils import record_kv_cache_layout
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 if TYPE_CHECKING:
-    from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 else:
@@ -107,42 +103,12 @@ class WorkerBase:
 
     def get_supported_kv_cache_layouts(self) -> list[str]:
         """Layout names every attention backend supports, most preferred first."""
+        from vllm.v1.worker.utils import get_supported_kv_cache_layouts
+
         backends = get_current_attn_backends(self.vllm_config)
-        layouts = get_supported_kv_cache_layouts(backends)
-        if self._prefers_packed_kv_cache(backends):
-            layouts.sort(key=lambda layout: not layout.is_block_outermost)
-        return [layout.name for layout in layouts]
-
-    def _prefers_packed_kv_cache(
-        self, backends: list[type["AttentionBackend"]]
-    ) -> bool:
-        """Whether a block-outermost layout should be preferred.
-
-        With mixed page sizes (e.g. a drafter with more KV bytes per token than
-        the target), block-outermost layouts pack layers of different page
-        sizes into one block instead of padding them to a common page and
-        splitting them into more KV cache groups. They cannot split a manager
-        block into smaller kernel blocks, so only prefer them when every
-        backend accepts each attention layer's block size directly, and when
-        packing avoids full attention padding or needs fewer groups.
-        """
-        from vllm.v1.core.kv_cache_utils import packed_kv_cache_layout_is_better
-        from vllm.v1.worker.utils import select_common_block_size
-
-        kv_cache_spec = self.get_kv_cache_spec()
-        specs = list(kv_cache_spec.values())
-        if len({spec.page_size_bytes for spec in specs}) <= 1:
-            return False
-        for spec in specs:
-            if not (isinstance(spec, AttentionSpec) and spec.has_layer_views):
-                continue
-            try:
-                kernel_block_size = select_common_block_size(spec.block_size, backends)
-            except ValueError:
-                return False
-            if kernel_block_size != spec.block_size:
-                return False
-        return packed_kv_cache_layout_is_better(self.vllm_config, kv_cache_spec)
+        return get_supported_kv_cache_layouts(
+            self.vllm_config, backends, self.get_kv_cache_spec()
+        )
 
     def set_kv_cache_layout(self, kv_cache_layout: str) -> None:
         """Adopt the KV cache layout resolved by the engine core."""

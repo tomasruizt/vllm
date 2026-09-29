@@ -26,7 +26,13 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     MultipleOf,
 )
-from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
+from vllm.v1.attention.backends.utils import (
+    get_supported_kv_cache_layouts as get_backend_supported_kv_cache_layouts,
+)
+from vllm.v1.core.kv_cache_utils import (
+    KVCacheBlockCopy,
+    packed_kv_cache_layout_is_better,
+)
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     EncoderOnlyAttentionSpec,
@@ -42,6 +48,47 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.block_table import get_block_table_width
 
 logger = init_logger(__name__)
+
+
+def get_supported_kv_cache_layouts(
+    vllm_config: VllmConfig,
+    backends: list[type[AttentionBackend]],
+    specs: dict[str, KVCacheSpec],
+) -> list[str]:
+    """Return supported layout names ordered by preference for the given specs."""
+    layouts = get_backend_supported_kv_cache_layouts(backends)
+    if _prefers_packed_kv_cache(vllm_config, backends, specs):
+        layouts.sort(key=lambda layout: not layout.is_block_outermost)
+    return [layout.name for layout in layouts]
+
+
+def _prefers_packed_kv_cache(
+    vllm_config: VllmConfig,
+    backends: list[type[AttentionBackend]],
+    specs: dict[str, KVCacheSpec],
+) -> bool:
+    """Whether a block-outermost layout should be preferred.
+
+    With mixed page sizes (e.g. a drafter with more KV bytes per token than
+    the target), block-outermost layouts pack layers of different page
+    sizes into one block instead of padding them to a common page and
+    splitting them into more KV cache groups. They cannot split a manager
+    block into smaller kernel blocks, so only prefer them when every
+    backend accepts each attention layer's block size directly, and when
+    packing avoids full attention padding or needs fewer groups.
+    """
+    if len({spec.page_size_bytes for spec in specs.values()}) <= 1:
+        return False
+    for spec in specs.values():
+        if not (isinstance(spec, AttentionSpec) and spec.has_layer_views):
+            continue
+        try:
+            kernel_block_size = select_common_block_size(spec.block_size, backends)
+        except ValueError:
+            return False
+        if kernel_block_size != spec.block_size:
+            return False
+    return packed_kv_cache_layout_is_better(vllm_config, specs)
 
 
 def raise_if_nan_logits(num_nans_in_logits: Mapping[str, int]) -> None:
