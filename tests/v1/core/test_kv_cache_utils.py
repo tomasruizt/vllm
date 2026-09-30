@@ -3066,9 +3066,7 @@ def test_mixed_page_size_groups_use_spec_compatibility():
         specs[f"indexer.{i}"] = new_indexer_mla_spec()
     specs.update({f"swa.{i}": new_swa_mla_spec(head_size=1024) for i in range(5)})
 
-    config = _grouping_config()
-    config.cache_config = CacheConfig()
-    config.cache_config.kv_cache_layout = "BLNHC"
+    config = _grouping_config(kv_cache_layout="BLNHC")
     groups = get_kv_cache_groups(config, specs)
 
     assert len(groups) == 3
@@ -3076,10 +3074,84 @@ def test_mixed_page_size_groups_use_spec_compatibility():
     assert sorted(len(group.layer_names) for group in groups) == [2, 3, 6]
 
 
-def _grouping_config():
-    cache_config = CacheConfig()
-    cache_config.kv_cache_layout = "LBNHC"
+def test_prefer_lbhnc_for_lower_max_memory_with_equal_group_counts():
+    """Given equal n kv-groups, prefer LBHNC over BLHNC when it uses less max memory."""
+    kwargs = dict(block_size=640, head_size=128, dtype=torch.bfloat16)
+    full_attn = new_kv_cache_spec(num_kv_heads=1, **kwargs)
+    sliding_attn = new_sliding_window_spec(num_kv_heads=2, sliding_window=128, **kwargs)
+    wider_sliding_attn = new_sliding_window_spec(
+        num_kv_heads=4, sliding_window=2048, **kwargs
+    )
+    specs = {
+        "full.0": full_attn,
+        "sw.0": sliding_attn,
+        "sw.1": sliding_attn,
+        "sw.2": wider_sliding_attn,
+    }
+
+    l_vllm_config = _vllm_config(kv_cache_layout="LBHNC")
+    b_vllm_config = _vllm_config(kv_cache_layout="BLHNC")
+    n_vllm_config = _vllm_config(kv_cache_layout=None)
+
+    # Both layouts have equal n_groups, no preference
+    assert len(get_kv_cache_groups(l_vllm_config, specs)) == 3
+    assert len(get_kv_cache_groups(b_vllm_config, specs)) == 3
+    # LBHNC has lower max mem than BLHNC, it should be preferred.
+    assert max_mem_usage(l_vllm_config, specs) == MiB(50)
+    assert max_mem_usage(b_vllm_config, specs) == MiB(73.75)
+
+    is_lbhnc_preferred = not kv_cache_utils.packed_kv_cache_layout_is_better(
+        n_vllm_config, specs
+    )
+    assert is_lbhnc_preferred
+
+
+def test_prefer_lbhnc_for_fewer_groups_with_equal_memory():
+    """Given equal memory use, prefer LBHNC over BLHNC if it uses fewer groups."""
+    kwargs = dict(block_size=640, head_size=128, dtype=torch.bfloat16)
+    full_attn = new_kv_cache_spec(num_kv_heads=2, **kwargs)
+    sliding_attn = new_sliding_window_spec(num_kv_heads=4, sliding_window=128, **kwargs)
+    specs = {"full.0": full_attn, "sw.0": sliding_attn, "sw.1": sliding_attn}
+
+    l_vllm_config = _vllm_config(kv_cache_layout="LBHNC")
+    b_vllm_config = _vllm_config(kv_cache_layout="BLHNC")
+    n_vllm_config = _vllm_config(kv_cache_layout=None)
+
+    # max mem usage is the same, no preference
+    assert max_mem_usage(l_vllm_config, specs) == max_mem_usage(b_vllm_config, specs)
+    # LBHNC uses fewer groups than BLHNC (2 < 3), it should be preferred.
+    assert len(get_kv_cache_groups(l_vllm_config, specs)) == 2
+    assert len(get_kv_cache_groups(b_vllm_config, specs)) == 3
+
+    is_lbhnc_preferred = not kv_cache_utils.packed_kv_cache_layout_is_better(
+        n_vllm_config, specs
+    )
+    assert is_lbhnc_preferred
+
+
+def _vllm_config(kv_cache_layout: str | None):
+    return _grouping_config(
+        kv_cache_layout=kv_cache_layout, min_kv_cache_group_layers=3
+    )
+
+
+def max_mem_usage(vllm_config, specs) -> int:
+    groups = get_kv_cache_groups(vllm_config, specs)
+    return kv_cache_utils._max_memory_usage_bytes_from_groups(vllm_config, groups)
+
+
+def MiB(x: float) -> int:
+    """Convert mebibytes to bytes."""
+    return int(x * 1024**2)
+
+
+def _grouping_config(
+    kv_cache_layout: str | None = "LBNHC", min_kv_cache_group_layers: int = 3
+):
+    cache_config = CacheConfig(min_kv_cache_group_layers=min_kv_cache_group_layers)
+    cache_config.kv_cache_layout = kv_cache_layout
     return SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         speculative_config=None,
         cache_config=cache_config,
@@ -3114,8 +3186,7 @@ def test_hybrid_group_size_selection(
             for i in range(num_draft_sw)
         },
     }
-    config = _grouping_config()
-    config.cache_config.min_kv_cache_group_layers = min_group_layers
+    config = _grouping_config(min_kv_cache_group_layers=min_group_layers)
     groups = get_kv_cache_groups(config, specs)
     assert max(len(group.layer_names) for group in groups) == expected_group_size
 
