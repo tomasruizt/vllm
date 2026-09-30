@@ -75,7 +75,7 @@ def _prefers_packed_kv_cache(
     splitting them into more KV cache groups. They cannot split a manager
     block into smaller kernel blocks, so only prefer them when every
     backend accepts each attention layer's block size directly, and when
-    packing avoids full attention padding or needs fewer groups.
+    packing uses less worst-case memory, or equal memory with fewer groups.
     """
     if len({spec.page_size_bytes for spec in specs.values()}) <= 1:
         return False

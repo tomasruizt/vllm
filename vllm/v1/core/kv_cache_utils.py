@@ -2144,9 +2144,7 @@ def _plan_packed_kv_cache_groups(
 def packed_kv_cache_layout_is_better(
     vllm_config: VllmConfig, kv_cache_spec: dict[str, KVCacheSpec]
 ) -> bool:
-    """Whether a block-outermost (packed) layout beats the layer-outermost
-    grouping: it avoids full attention padding, whose memory grows with the
-    context, or needs fewer KV cache groups."""
+    """Prefer lower worst-case memory usage, then fewer KV cache groups."""
     specs = {
         name: spec
         for name, spec in kv_cache_spec.items()
@@ -2161,13 +2159,11 @@ def packed_kv_cache_layout_is_better(
         )
     except NotImplementedError:
         return True
-    group_size = max(len(group.layer_names) for group in uniform)
-    pads_full_attention = any(
-        isinstance(group.kv_cache_spec, FullAttentionSpec)
-        and len(group.layer_names) < group_size
-        for group in uniform
-    )
-    return pads_full_attention or len(packed) < len(uniform)
+    # Both uniform and packed layouts are viable
+    uniform_bytes = _max_memory_usage_bytes_from_groups(vllm_config, uniform)
+    packed_bytes = _max_memory_usage_bytes_from_groups(vllm_config, packed)
+    # Prefer the layout that uses less memory, then fewer groups.
+    return (packed_bytes, len(packed)) < (uniform_bytes, len(uniform))
 
 
 def _uses_trailing_mtp_layers(vllm_config: VllmConfig) -> bool:

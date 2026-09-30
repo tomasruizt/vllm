@@ -1489,6 +1489,7 @@ def _backend(*kernel_block_sizes):
 
 def _grouping_vllm_config():
     return SimpleNamespace(
+        attention_config=SimpleNamespace(hisparse_config=None),
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
         speculative_config=None,
         cache_config=SimpleNamespace(min_kv_cache_group_layers=3),
