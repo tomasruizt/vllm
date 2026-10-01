@@ -1638,6 +1638,7 @@ def test_draft_parallel_config_preserves_ep_without_model(
         pytest.param("ngram", False, 0, id="ngram"),
         pytest.param("draft_model", False, 1, id="draft-model"),
         pytest.param("draft_model", True, 8, id="pard"),
+        pytest.param("xpress", True, 8, id="xpress"),
     ],
 )
 def test_max_num_new_slots_for_drafting(method, parallel_drafting, expected_slots):
