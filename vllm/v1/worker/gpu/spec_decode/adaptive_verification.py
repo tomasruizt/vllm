@@ -349,6 +349,44 @@ class AdaptiveVerificationManager:
         )
         return sum(num_non_draft_tokens_per_req.values()) + draft_budget
 
+    def expand_budget_to_fit(self, num_tokens: int) -> int:
+        """Use synchronized graph padding for additional scheduled drafts."""
+        assert self._batch_budget is not None
+        num_drafts_per_req, num_non_draft_tokens_per_req, old_draft_budget = (
+            self._batch_budget
+        )
+        num_non_draft_tokens = sum(num_non_draft_tokens_per_req.values())
+        assert num_tokens >= num_non_draft_tokens + old_draft_budget
+        max_draft_budget = int_clamp(
+            x=self._max_total_logits - len(num_drafts_per_req) * self.num_bonus_tokens,
+            low=0,
+            high=sum(num_drafts_per_req.values()),
+        )
+        assert max_draft_budget >= old_draft_budget
+        new_draft_budget = int_clamp(
+            x=num_tokens - num_non_draft_tokens,
+            low=old_draft_budget,
+            high=max_draft_budget,
+        )
+        if new_draft_budget > old_draft_budget and not getattr(
+            self, "_logged_budget_expansion", False
+        ):
+            logger.info(
+                "AV reclaimed DP graph padding: draft budget %d -> %d, "
+                "non-draft tokens %d, graph capacity %d",
+                old_draft_budget,
+                new_draft_budget,
+                num_non_draft_tokens,
+                num_tokens,
+            )
+            self._logged_budget_expansion = True
+        self._batch_budget = (
+            num_drafts_per_req,
+            num_non_draft_tokens_per_req,
+            new_draft_budget,
+        )
+        return num_non_draft_tokens + new_draft_budget
+
     def compact_batch(
         self,
         num_draft_tokens_per_req: np.ndarray,
@@ -507,3 +545,7 @@ def maybe_create_adaptive_verification_manager(
         num_bonus_tokens,
         max_total_logits=max_total_logits,
     )
+
+
+def int_clamp(x: int, low: int, high: int) -> int:
+    return min(max(x, low), high)

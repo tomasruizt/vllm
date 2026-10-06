@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
@@ -182,6 +183,64 @@ def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():
     assert draft_budget == 1
     assert valid_drafts == {"low": 2, "high": 2}
     assert num_non_draft_tokens == {"low": 1, "high": 1}
+
+
+@pytest.mark.parametrize(
+    "graph_tokens,max_logits,expected_tokens",
+    [(4, 100, 4), (10, 100, 6), (10, 3, 3), (10, 1, 2)],
+)
+def test_graph_padding_expansion_respects_drafts_and_sampler_capacity(
+    graph_tokens, max_logits, expected_tokens
+):
+    manager = make_manager(
+        np.array([[0.1, 0.1], [0.9, 0.9]], dtype=np.float32),
+        np.array([1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 100.0]),
+    )
+    manager._max_total_logits = max_logits
+    scheduled = {"low": 3, "high": 3}
+    drafts = {"low": [1, 2], "high": [3, 4]}
+    original_tokens = manager.get_num_tokens(scheduled, drafts)
+
+    expanded_tokens = manager.expand_budget_to_fit(graph_tokens)
+    assert original_tokens <= expanded_tokens == expected_tokens <= graph_tokens
+    compacted, _ = manager.compact_batch(
+        np.array([2, 2], dtype=np.int32),
+        np.array([3, 3], dtype=np.int32),
+        np.array([0, 3, 6], dtype=np.int32),
+    )
+    assert compacted.sum() == expanded_tokens
+
+
+def test_expanded_budget_verifies_highest_confidence_remaining_drafts(monkeypatch):
+    manager = make_manager(
+        np.array([[0.1, 0.1], [0.9, 0.9]], dtype=np.float32),
+        np.array([1.0, 1.0, 1.0, 1.0, 100.0, 100.0, 100.0]),
+    )
+    manager.get_num_tokens({"low": 3, "high": 3}, {"low": [1, 2], "high": [3, 4]})
+    assert manager.expand_budget_to_fit(4) == 4
+    manager._confidence_probs = torch.tensor([[0.1, 0.1], [0.9, 0.9]])
+    manager._batch_draft_capacity = torch.empty(2, dtype=torch.int32)
+    manager._num_non_draft_tokens = torch.empty(2, dtype=torch.int32)
+    manager._cu_num_logits = torch.empty(3, dtype=torch.int32)
+    manager.query_start_loc = torch.empty(4, dtype=torch.int32)
+    monkeypatch.setattr(
+        adaptive_module,
+        "async_tensor_h2d",
+        lambda array, out: out.copy_(torch.from_numpy(array)),
+    )
+    monkeypatch.setattr(
+        adaptive_module,
+        "_assign_draft_token_budget_compiled",
+        adaptive_module._assign_draft_token_budget,
+    )
+
+    logits, query_starts, draft_budget = manager.reallocate_drafts(
+        ["low", "high"], torch.tensor([0, 1])
+    )
+    assert draft_budget == 2
+    assert logits.tolist() == [0, 1, 4]
+    assert query_starts.tolist() == [0, 1, 4, 4]
+    assert manager._batch_draft_capacity.tolist() == [0, 2]
 
 
 def test_profiled_batches_seed_cost_curves_via_consumer(monkeypatch):

@@ -5,10 +5,12 @@ import contextlib
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
 import vllm.v1.worker.gpu.model_runner as model_runner_module
+from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.warmup.jit_warmup import JitWarmupRegistry
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
@@ -19,7 +21,94 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
+from vllm.v1.worker.gpu.model_runner import (
+    BatchReqState,
+    ExecuteModelState,
+    GPUModelRunner,
+)
+from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
+    AdaptiveVerificationManager,
+)
+
+
+@pytest.mark.parametrize(
+    "mode,dp_size,num_ubatches,query_bound,expected_tokens",
+    [
+        (CUDAGraphMode.FULL, 4, 1, 3, 4),
+        (CUDAGraphMode.NONE, 4, 1, 3, 3),
+        (CUDAGraphMode.FULL, 1, 1, 3, 3),
+        (CUDAGraphMode.FULL, 4, 2, 3, 3),
+        (CUDAGraphMode.FULL, 4, 1, None, 3),
+    ],
+)
+def test_reclaim_dp_graph_padding_after_sync_before_input_preparation(
+    monkeypatch, mode, dp_size, num_ubatches, query_bound, expected_tokens
+):
+    """Sync sees AV's original count; preparation sees any expanded budget."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    for name in (
+        "update_pp_decode_requests",
+        "finish_requests",
+        "free_states",
+        "add_requests",
+        "update_requests",
+    ):
+        setattr(runner, name, Mock())
+    runner.block_tables = Mock()
+    runner.aux_output_connector = runner.pcp_manager = runner.lora_config = None
+    runner.ubatch_runner = None
+    runner.is_encoder_decoder = False
+    runner.parallel_config = SimpleNamespace(
+        data_parallel_size=dp_size, data_parallel_rank=0
+    )
+    runner.observability_config = SimpleNamespace(cudagraph_metrics=False)
+    runner.decode_query_len = 3
+    runner.cudagraph_manager = Mock()
+    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+    manager._batch_budget = ({"a": 2, "b": 2}, {"a": 1, "b": 1}, 1)
+    manager._max_total_logits, manager.num_bonus_tokens = 100, 1
+    runner.adaptive_verification = manager
+    state = BatchReqState(
+        req_ids=["a", "b"],
+        num_scheduled_tokens=np.array([3, 3]),
+        num_tokens=3,
+        num_draft_tokens_np=np.array([2, 2]),
+        idx_mapping_np=np.array([0, 1]),
+        prefill_len_np=np.array([16, 16]),
+        num_computed_prefill_tokens_np=np.array([16, 16]),
+        is_prefilling_np=np.array([False, False]),
+        max_seq_len_np=None,
+        has_prefill=False,
+        prefill_runs_as_decode_np=None,
+        decode_graph_eligible=True,
+    )
+    runner.gather_batch_req_state = Mock(return_value=(state, None))
+    scheduler_output = SimpleNamespace(
+        num_scheduled_tokens={"a": 3, "b": 3},
+        total_num_scheduled_tokens=6,
+        scheduled_spec_decode_tokens={"a": [1, 2], "b": [3, 4]},
+    )
+    descriptor = BatchExecutionDescriptor(
+        mode, 4, 4, max_query_len=query_bound, num_ubatches=num_ubatches
+    )
+    dispatch = Mock(return_value=(descriptor, object() if dp_size > 1 else None))
+    monkeypatch.setattr(model_runner_module, "dispatch_cg_and_sync_dp", dispatch)
+
+    class InputsPrepared(Exception):
+        pass
+
+    def prepare_inputs(_scheduler, batch_state, batch_desc, _num_loras):
+        assert batch_desc is descriptor
+        assert state.num_tokens == 3
+        assert batch_state.num_tokens == expected_tokens
+        assert manager._batch_budget[2] == expected_tokens - 2
+        raise InputsPrepared
+
+    runner.prepare_inputs = prepare_inputs
+    with pytest.raises(InputsPrepared):
+        runner.execute_model(scheduler_output)
+    assert dispatch.call_args.args[2] == 3
 
 
 def test_non_last_pp_rank_uses_global_batch_for_sample_feedback():

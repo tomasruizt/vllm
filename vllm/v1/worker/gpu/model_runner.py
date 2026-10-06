@@ -1782,9 +1782,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
+            assert batch_req_state is not None
+            if (
+                self.adaptive_verification is not None
+                and scheduler_output.scheduled_spec_decode_tokens
+                and dp_sync is not None
+                and batch_desc.cg_mode == CUDAGraphMode.FULL
+                and batch_desc.num_ubatches == 1
+                and batch_desc.max_query_len is not None
+                and num_toks < batch_desc.num_tokens
+            ):
+                # The graph shape is already agreed across DP ranks. Reclaim
+                # padding without changing that shape or its query-length bound.
+                num_toks = self.adaptive_verification.expand_budget_to_fit(
+                    batch_desc.num_tokens
+                )
+                batch_req_state = batch_req_state._replace(num_tokens=num_toks)
             if self.observability_config.cudagraph_metrics:
                 cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
-            assert batch_req_state is not None
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
