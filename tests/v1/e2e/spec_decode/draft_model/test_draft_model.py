@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections import Counter
 from dataclasses import dataclass
 
 import pytest
-import regex as re
-from scipy.stats import chi2_contingency
 
 from tests.utils import multi_gpu_only, single_gpu_only
 from vllm import SamplingParams
@@ -14,7 +11,6 @@ from vllm.config import CompilationConfig, VllmConfig, replace
 from vllm.config.kernel import MoEBackend
 from vllm.engine.arg_utils import EngineArgs
 from vllm.platforms import current_platform
-from vllm.sampling_params import StructuredOutputsParams
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 
 from ..utils import (
@@ -97,67 +93,6 @@ cases = [
 def test_draft_model_correctness(args: ArgsTest, enforce_eager: bool, vllm_runner):
     args.enforce_eager = enforce_eager
     assert_draft_model_correctness(args, vllm_runner)
-
-
-@pytest.mark.parametrize("rejection_sample_method", ["standard", "block"])
-@single_gpu_only
-def test_structured_output_preserves_sampling_distribution(
-    rejection_sample_method, vllm_runner, monkeypatch
-):
-    """Forbidden drafts must recover from the residual, preserving target odds."""
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
-    regex = r'\{"city": "(Paris|Berlin|Rome|Madrid|Vienna|Lisbon|Prague|Oslo)"\}'
-    num_samples = 4000
-    spec = {
-        "method": "draft_model",
-        "model": "Qwen/Qwen3-0.6B",
-        "num_speculative_tokens": 3,
-        "draft_sample_method": "probabilistic",
-        "rejection_sample_method": rejection_sample_method,
-    }
-    counts = []
-    for speculative_config in (None, spec):
-        with vllm_runner(
-            "Qwen/Qwen3-1.7B",
-            speculative_config=speculative_config,
-            enforce_eager=True,
-            enable_prefix_caching=False,
-            gpu_memory_utilization=0.4,
-            disable_log_stats=False,
-        ) as runner:
-            params = [
-                SamplingParams(
-                    temperature=1.0,
-                    max_tokens=32,
-                    seed=i,
-                    structured_outputs=StructuredOutputsParams(regex=regex),
-                )
-                for i in range(num_samples)
-            ]
-            outputs = runner.get_llm().chat(
-                [[{"role": "user", "content": "Name a random European capital."}]]
-                * num_samples,
-                params,
-                use_tqdm=False,
-                chat_template_kwargs={"enable_thinking": False},
-            )
-            if speculative_config is not None:
-                assert compute_acceptance_rate(runner.get_llm().get_metrics()) > 0
-            matches = [re.fullmatch(regex, o.outputs[0].text) for o in outputs]
-            assert all(matches), "Grammar-invalid output"
-            counts.append(
-                Counter(match.group(1) for match in matches if match is not None)
-            )
-
-    # Pool rare cities so the chi-square test has adequate expected counts.
-    cities = [c for c in counts[0] | counts[1] if sum(n[c] for n in counts) >= 20]
-    rows = [[n[c] for c in cities] for n in counts]
-    remainder = [num_samples - sum(row) for row in rows]
-    if sum(remainder):
-        for row, tail in zip(rows, remainder):
-            row.append(tail)
-    _, p, _, _ = chi2_contingency(rows, correction=False)
-    assert p > 1e-3, f"Speculative decoding changed the distribution: {counts}, {p=}"
 
 
 @single_gpu_only

@@ -318,7 +318,7 @@ steps:
     - vllm/v1/worker/gpu/spec_decode/
     - tests/v1/e2e/spec_decode/
   commands:
-    - pytest -v -s v1/e2e/spec_decode/draft_model/ --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB
+    - pytest -v -s v1/e2e/spec_decode/draft_model/ v1/e2e/spec_decode/distribution_shift.py --num-shards=$$BUILDKITE_PARALLEL_JOB_COUNT --shard-id=$$BUILDKITE_PARALLEL_JOB
   mirror:
     amd:
       label: ":amd: (MI355 DPX) Spec Decode Draft Model Shard %N"
