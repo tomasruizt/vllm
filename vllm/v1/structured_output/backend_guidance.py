@@ -202,13 +202,18 @@ class GuidanceGrammar(StructuredOutputGrammar):
         Returns True if the parser was advanced successfully.
         Returns False if the parser failed to advance.
         """
+        # Consuming a forbidden draft irreversibly errors the matcher.
+        if not self.ll_matcher.is_stopped() and self.ll_matcher.validate_tokens(
+            tokens
+        ) != len(tokens):
+            return False
         if self.ll_tokenizer.eos_token in tokens:
             if self.ll_matcher.is_stopped() and not self.terminated:
                 self.rollback_lag = 1
             self.terminated = True
 
         if self.ll_matcher.is_stopped():
-            return True
+            return self.terminated
 
         # TODO - Add jump decoding support in the future:
         # self.ll_matcher.compute_ff_bytes() - this should always work

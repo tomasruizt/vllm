@@ -129,6 +129,11 @@ def test_grammar_bitmask_with_specdec():
         assert grammar is not None and not isinstance(grammar, Exception)
         assert grammar.accept_tokens(request.request_id, prompt[:i])
 
+        grammar_bitmask(request, [tokenizer.eos_token_id])
+        assert grammar.validate_tokens(prompt[i:]) == prompt[i:]
+        grammar_bitmask(request, prompt[i:] + tokenizer.encode("invalid"))
+        assert grammar.validate_tokens(prompt[i:]) == prompt[i:]
+
         grammar_bitmask(request, prompt[i:] + [tokenizer.eos_token_id])
         grammar_bitmask(
             request, prompt[i:] + [tokenizer.eos_token_id] + prompt
