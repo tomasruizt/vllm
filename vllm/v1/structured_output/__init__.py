@@ -409,12 +409,6 @@ class StructuredOutputManager:
                             state_advancements += 1
                         else:
                             failed_index = cumulative_index
-                            logger.error(
-                                "Unexpected: grammar terminated or rejected draft "
-                                "token %s for request %s during bitmask fill.",
-                                token,
-                                req_id,
-                            )
                     cumulative_index += 1
 
                 # Diffusion LLMs don't sample a bonus token after the

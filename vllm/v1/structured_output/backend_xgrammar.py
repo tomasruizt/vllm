@@ -161,6 +161,8 @@ class XgrammarBackend(StructuredOutputBackend):
             ),
             vocab_size=self.vocab_size,
             ctx=ctx,
+            # Invalid draft tokens are expected to reach the grammar
+            log_errors=self.num_speculative_tokens == 0,
         )
 
     def allocate_token_bitmask(self, max_num_seqs: int):
@@ -186,6 +188,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
         default_factory=lambda: 0, repr=False, hash=False, init=False
     )
     _is_terminated: bool = field(default=False, repr=False, hash=False)
+    log_errors: bool = True
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         """Accepts a list of tokens and advances the FSM.
@@ -198,12 +201,13 @@ class XgrammarGrammar(StructuredOutputGrammar):
             return True
         for token in tokens:
             if not self.matcher.accept_token(token):
-                logger.error(
-                    "Failed to advance FSM for request %s "
-                    "for tokens %s. Please file an issue.",
-                    request_id,
-                    token,
-                )
+                if self.log_errors:
+                    logger.error(
+                        "Failed to advance FSM for request %s "
+                        "for tokens %s. Please file an issue.",
+                        request_id,
+                        token,
+                    )
                 return False
             self.num_processed_tokens += 1
             self._is_terminated = self.matcher.is_terminated()
