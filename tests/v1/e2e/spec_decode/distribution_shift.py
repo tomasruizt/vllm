@@ -17,9 +17,8 @@ from .utils import compute_acceptance_rate
 @pytest.mark.parametrize("rejection_sample_method", ["standard", "block"])
 @single_gpu_only
 def test_structured_output_preserves_sampling_distribution(
-    rejection_sample_method, vllm_runner, monkeypatch
+    rejection_sample_method, vllm_runner
 ):
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     spec_config = {
         "method": "dflash",
         "model": "z-lab/Qwen3-4B-DFlash-b16",
