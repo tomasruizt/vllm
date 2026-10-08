@@ -19,7 +19,6 @@ from .utils import compute_acceptance_rate
 def test_structured_output_preserves_sampling_distribution(
     rejection_sample_method, vllm_runner, monkeypatch
 ):
-    """Forbidden drafts must recover from the residual, preserving target odds."""
     monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     spec_config = {
         "method": "dflash",
