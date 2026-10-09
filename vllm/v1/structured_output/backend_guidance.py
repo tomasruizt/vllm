@@ -20,7 +20,6 @@ from vllm.v1.structured_output.backend_types import (
     StructuredOutputOptions,
 )
 from vllm.v1.structured_output.request import get_structured_output_key
-from vllm.v1.structured_output.utils import strip_speculative_padding
 
 if TYPE_CHECKING:
     import llguidance
@@ -227,27 +226,6 @@ class GuidanceGrammar(StructuredOutputGrammar):
         self.check_error()
 
         return r
-
-    def validate_tokens(self, tokens: list[int]) -> list[int]:
-        """Checks if the list of tokens are accepted by the parser in sequence.
-        Will not advance the parser.
-
-        Returns the prefix list of tokens that are accepted by the parser.
-        """
-        if len(tokens) == 0:
-            return []
-        if self.ll_matcher.is_stopped():
-            return []
-
-        tokens = strip_speculative_padding(tokens)
-        if len(tokens) == 0:
-            return []
-
-        num_tokens = self.ll_matcher.validate_tokens(tokens)
-
-        self.check_error()
-
-        return tokens[:num_tokens]
 
     def rollback(self, num_tokens: int) -> None:
         if num_tokens > 0:

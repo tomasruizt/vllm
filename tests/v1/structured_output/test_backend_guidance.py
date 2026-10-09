@@ -66,8 +66,8 @@ def test_backend_guidance_rollback_terminated():
     # Rollback is done from where state was terminated, so from '}' not EOS
     grammar.rollback(len(prompt) - 1)
     assert not grammar.is_terminated()
-    assert grammar.validate_tokens([tokenizer.eos_token_id]) == []
-    assert grammar.validate_tokens(dummy_wrong) != dummy_wrong
+    assert not grammar.accept_tokens("", [tokenizer.eos_token_id])
+    assert not grammar.accept_tokens("", dummy_wrong)
     assert grammar.accept_tokens("", prompt[1:])
     assert not grammar.is_terminated()
     assert grammar.accept_tokens("", [tokenizer.eos_token_id])
@@ -130,9 +130,11 @@ def test_grammar_bitmask_with_specdec():
         assert grammar.accept_tokens(request.request_id, prompt[:i])
 
         grammar_bitmask(request, [tokenizer.eos_token_id])
-        assert grammar.validate_tokens(prompt[i:]) == prompt[i:]
+        assert grammar.accept_tokens(request.request_id, prompt[i:])
+        grammar.rollback(len(prompt) - i)
         grammar_bitmask(request, prompt[i:] + tokenizer.encode("invalid"))
-        assert grammar.validate_tokens(prompt[i:]) == prompt[i:]
+        assert grammar.accept_tokens(request.request_id, prompt[i:])
+        grammar.rollback(len(prompt) - i)
 
         grammar_bitmask(request, prompt[i:] + [tokenizer.eos_token_id])
         grammar_bitmask(
@@ -322,5 +324,5 @@ def test_disable_additional_properties_accepts_literal_with_properties_key(
         tokenizer.eos_token_id
     ]
 
-    assert grammar.validate_tokens(valid_tokens) == valid_tokens
-    assert grammar.validate_tokens(rewritten_tokens) != rewritten_tokens
+    assert not grammar.accept_tokens("", rewritten_tokens)
+    assert grammar.accept_tokens("", valid_tokens)

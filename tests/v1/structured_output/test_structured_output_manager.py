@@ -494,6 +494,6 @@ def test_outlines_termination(tokenizer):
     grammar.rollback(2)
     assert not grammar.is_terminated()
     assert grammar.num_processed_tokens == 0
-    assert grammar.validate_tokens([eos]) == []
+    assert not grammar.accept_tokens(request.request_id, [eos])
     assert grammar.accept_tokens(request.request_id, [one, eos, one])
     assert grammar.is_terminated()

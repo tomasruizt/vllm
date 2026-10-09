@@ -156,30 +156,6 @@ class OutlinesGrammar(StructuredOutputGrammar):
         if num_tokens:
             self.guide.rollback_state(num_tokens)
 
-    def validate_tokens(self, tokens: list[int]) -> list[int]:
-        if self._is_terminated:
-            return []
-        accepted: list[int] = []
-        for tok in tokens:
-            if tok == self.eos_token_id:
-                if self._is_finished_after(accepted):
-                    accepted.append(tok)
-                break
-            accepted.append(tok)
-            if not self.guide.accepts_tokens(accepted):
-                accepted.pop()
-                break
-        return accepted
-
-    def _is_finished_after(self, tokens: list[int]) -> bool:
-        if not tokens:
-            return self.guide.is_finished()
-        for t in tokens:
-            self.guide.advance(t)
-        finished = self.guide.is_finished()
-        self.guide.rollback_state(len(tokens))
-        return finished
-
     def fill_bitmask(self, bitmask: torch.Tensor, idx: int) -> None:
         mask = bitmask[idx]
         self.guide.write_mask_into(mask.data_ptr(), mask.numel(), mask.element_size())

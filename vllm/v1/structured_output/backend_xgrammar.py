@@ -215,28 +215,6 @@ class XgrammarGrammar(StructuredOutputGrammar):
                 break
         return True
 
-    def validate_tokens(self, tokens: list[int]) -> list[int]:
-        """Checks if the list of tokens are accepted by the FSM in sequence.
-        Will not advance the FSM.
-
-        Returns the prefix list of tokens that are accepted by the FSM.
-        """
-        if self._is_terminated:
-            return []
-
-        accepted_tokens = []
-        for token in tokens:
-            if self.matcher.accept_token(token):
-                accepted_tokens.append(token)
-                if self.matcher.is_terminated():
-                    break
-            else:
-                break
-        if len(accepted_tokens) > 0:
-            # Rollback the FSM to the initial state
-            self.matcher.rollback(len(accepted_tokens))
-        return accepted_tokens
-
     def rollback(self, num_tokens: int) -> None:
         self.matcher.rollback(num_tokens)
         self.num_processed_tokens -= num_tokens
