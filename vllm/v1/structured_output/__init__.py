@@ -303,6 +303,12 @@ class StructuredOutputManager:
 
         # Covers both speculative decoding and diffusion LLMs (canvas_length).
         max_num_spec_tokens = self.vllm_config.num_speculative_tokens
+        spec_config = self.vllm_config.speculative_config
+        skip_rejected_suffix = (
+            spec_config is not None
+            and spec_config.rejection_sample_method in ("standard", "block")
+            and not self.vllm_config.model_config.is_diffusion
+        )
 
         if self._grammar_bitmask is None:
             assert self.backend is not None
@@ -369,13 +375,16 @@ class StructuredOutputManager:
                 )
                 state_advancements = 0
                 seen_padding = False
-                # Row filled from the last valid grammar state before a draft
-                # was rejected; later rows reuse it rather than unconstraining.
+                # Keep the first rejected draft's mask for correct resampling.
+                # Standard/block verification cannot emit its later positions.
                 failed_index: int | None = None
                 bitmask = self._grammar_bitmask
                 for i, token in enumerate(req_tokens):
                     if failed_index is not None:
-                        bitmask[cumulative_index].copy_(bitmask[failed_index])
+                        if skip_rejected_suffix:
+                            bitmask[cumulative_index].fill_(self._full_mask)
+                        else:
+                            bitmask[cumulative_index].copy_(bitmask[failed_index])
                         cumulative_index += 1
                         continue
                     apply_bitmask = not seen_padding and i >= constraint_start
@@ -395,7 +404,10 @@ class StructuredOutputManager:
                 # scheduled positions, so skip its bitmask in that case.
                 if not (self.vllm_config.model_config.is_diffusion and req_tokens):
                     if failed_index is not None:
-                        bitmask[cumulative_index].copy_(bitmask[failed_index])
+                        if skip_rejected_suffix:
+                            bitmask[cumulative_index].fill_(self._full_mask)
+                        else:
+                            bitmask[cumulative_index].copy_(bitmask[failed_index])
                     else:
                         bonus_apply = not seen_padding and constraint_start <= len(
                             req_tokens
