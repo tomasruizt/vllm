@@ -291,26 +291,6 @@ class StructuredOutputManager:
                 return i + 1
         return 1
 
-    def validate_tokens(self, request: "Request", spec_tokens: list[int]) -> list[int]:
-        """Return the longest unconstrained or grammar-valid prefix of `spec_tokens`."""
-        if not request.use_structured_output:
-            return spec_tokens
-
-        spec_tokens = strip_speculative_padding(spec_tokens)
-        constraint_start = self._get_constraint_start(request, spec_tokens)
-        if constraint_start >= len(spec_tokens):
-            return spec_tokens
-
-        structured_req = request.structured_output_request
-        if TYPE_CHECKING:
-            assert structured_req is not None
-        grammar = structured_req.grammar
-        if TYPE_CHECKING:
-            assert isinstance(grammar, StructuredOutputGrammar)
-        prefix = spec_tokens[:constraint_start]
-        validated = grammar.validate_tokens(spec_tokens[constraint_start:])
-        return prefix + validated
-
     def grammar_bitmask(
         self,
         requests: dict[str, "Request"],
