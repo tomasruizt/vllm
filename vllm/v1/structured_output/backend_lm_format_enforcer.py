@@ -58,19 +58,6 @@ class LMFormatEnforcerGrammar(StructuredOutputGrammar):
             self.current_tokens_prefix.append(token)
         return True
 
-    def validate_tokens(self, tokens: list[int]) -> list[int]:
-        for prefix_length in range(len(tokens)):
-            prefix = tokens[:prefix_length]
-            next_token = tokens[prefix_length]
-            if not self.token_enforcer.get_allowed_tokens(
-                self.current_tokens_prefix + prefix
-            ).is_token_allowed(next_token):
-                break
-        else:
-            return tokens
-
-        return tokens[:prefix_length]
-
     def rollback(self, num_tokens: int) -> None:
         self.current_tokens_prefix = self.current_tokens_prefix[:-num_tokens]
 

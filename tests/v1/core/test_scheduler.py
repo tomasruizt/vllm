@@ -7321,8 +7321,7 @@ def _decode_ready_request(scheduler):
 
 
 def test_update_draft_token_ids_strips_ngram_padding():
-    """ngram_gpu pads unfilled draft slots with -1; manager validation must
-    strip them before grammar.validate_tokens (which otherwise raises)."""
+    """Strip ngram padding while preserving real drafts for rejection sampling."""
     scheduler = create_scheduler(num_speculative_tokens=4)
     request = _decode_ready_request(scheduler)
 
@@ -7335,13 +7334,12 @@ def test_update_draft_token_ids_strips_ngram_padding():
         DraftTokenIds([request.request_id], [[10, 11, -1, -1]])
     )
 
-    assert grammar.seen == [[10, 11]]
+    assert grammar.seen == []
     assert request.spec_token_ids == [10, 11]
 
 
 def test_update_draft_token_ids_in_output_strips_padding():
-    """Same guard on the output path; the -1 pad-back for the rejected count
-    is preserved (only the input to manager validation is stripped)."""
+    """Strip actual padding and restore the scheduled width without validation."""
     scheduler = create_scheduler(num_speculative_tokens=4)
     request = _decode_ready_request(scheduler)
 
@@ -7358,8 +7356,8 @@ def test_update_draft_token_ids_in_output_strips_padding():
         scheduler_output,
     )
 
-    # The grammar only saw the stripped prefix, never a -1.
-    assert grammar.seen == [[10, 11]]
+    # No draft validation: only true padding is removed before pad-back.
+    assert grammar.seen == []
     # Two drafts were rejected (4 scheduled - 2 valid), padded back with -1.
     assert scheduler_output.scheduled_spec_decode_tokens[request.request_id] == [
         10,
@@ -7441,7 +7439,7 @@ def test_diffusion_scheduler_narrows_the_canvas_per_request():
 def test_diffusion_scheduler_trims_full_width_worker_drafts(
     structured, async_scheduling
 ):
-    """Padded worker drafts must be narrowed before scheduling or grammar validation."""
+    """Padded worker drafts must be narrowed before scheduling."""
     scheduler = _diffusion_scheduler(async_scheduling=async_scheduling)
     wide = _diffusion_request("wide", {})
     narrow = _diffusion_request("narrow", {"diffusion_canvas_length": 4})
@@ -7470,8 +7468,8 @@ def test_diffusion_scheduler_trims_full_width_worker_drafts(
     }
     assert output.num_scheduled_tokens == {"wide": 8, "narrow": 4}
     if structured:
-        assert wide.structured_output_request.grammar.seen == [tokens]
-        assert narrow.structured_output_request.grammar.seen == [tokens[:4]]
+        assert wide.structured_output_request.grammar.seen == []
+        assert narrow.structured_output_request.grammar.seen == []
 
 
 @pytest.mark.parametrize(

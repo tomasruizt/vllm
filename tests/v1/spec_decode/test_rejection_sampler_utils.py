@@ -809,10 +809,11 @@ def test_greedy_placeholder_emits_target_argmax():
 
 
 @pytest.mark.parametrize("use_block_verification", [False, True])
-def test_placeholder_blocks_later_draft_tokens(use_block_verification: bool):
-    """A placeholder is not necessarily the final draft. Nothing at or after
-    one may be accepted, even when a valid draft follows it.
-    """
+@pytest.mark.parametrize("rejected_draft", [-1, 0])
+def test_rejection_blocks_later_draft_tokens(
+    use_block_verification: bool, rejected_draft: int
+):
+    """Neither padding nor a grammar rejection may admit later real drafts."""
     torch.manual_seed(0)
     device = "cuda"
     num_trials = 4 * VOCAB_SIZE
@@ -832,9 +833,10 @@ def test_placeholder_blocks_later_draft_tokens(use_block_verification: bool):
         temperature=temperature,
         num_trials=num_trials,
     )
-    inputs["draft_sampled"].view(num_trials, K + 1)[:, 2] = -1
+    inputs["draft_sampled"].view(num_trials, K + 1)[:, 2] = rejected_draft
+    inputs["target_logits"][1 :: K + 1, 0] = -torch.inf
 
-    _, num_sampled = rejection_sample(
+    sampled, num_sampled = rejection_sample(
         **inputs,
         num_speculative_steps=K,
         use_block_verification=use_block_verification,
@@ -846,6 +848,7 @@ def test_placeholder_blocks_later_draft_tokens(use_block_verification: bool):
         "The first draft was rarely accepted; the test is not exercising "
         "acceptance past the placeholder."
     )
+    assert (sampled[num_sampled == 2, 1] != 0).all()
 
 
 def test_verify_rejects_unproposed_drafts():

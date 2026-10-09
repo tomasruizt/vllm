@@ -1158,8 +1158,8 @@ class TestAdjustRequest:
 
         for sample_name in cls.ADMISSION_SAMPLES:
             tokens = encode_output(getattr(cls, sample_name))
-            accepted = grammar.validate_tokens(tokens)
-            admitted = accepted == tokens
+            grammar.reset()
+            admitted = grammar.accept_tokens(sample_name, tokens)
             should_admit = sample_name in expected_admission_set
             assert admitted is should_admit, (
                 f"Expected structured_outputs admission for {sample_name} "

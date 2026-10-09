@@ -161,6 +161,8 @@ class XgrammarBackend(StructuredOutputBackend):
             ),
             vocab_size=self.vocab_size,
             ctx=ctx,
+            # Invalid draft tokens are expected to reach the grammar
+            log_errors=self.num_speculative_tokens == 0,
         )
 
     def allocate_token_bitmask(self, max_num_seqs: int):
@@ -186,6 +188,7 @@ class XgrammarGrammar(StructuredOutputGrammar):
         default_factory=lambda: 0, repr=False, hash=False, init=False
     )
     _is_terminated: bool = field(default=False, repr=False, hash=False)
+    log_errors: bool = True
 
     def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
         """Accepts a list of tokens and advances the FSM.
@@ -198,40 +201,19 @@ class XgrammarGrammar(StructuredOutputGrammar):
             return True
         for token in tokens:
             if not self.matcher.accept_token(token):
-                logger.error(
-                    "Failed to advance FSM for request %s "
-                    "for tokens %s. Please file an issue.",
-                    request_id,
-                    token,
-                )
+                if self.log_errors:
+                    logger.error(
+                        "Failed to advance FSM for request %s "
+                        "for tokens %s. Please file an issue.",
+                        request_id,
+                        token,
+                    )
                 return False
             self.num_processed_tokens += 1
             self._is_terminated = self.matcher.is_terminated()
             if self._is_terminated:
                 break
         return True
-
-    def validate_tokens(self, tokens: list[int]) -> list[int]:
-        """Checks if the list of tokens are accepted by the FSM in sequence.
-        Will not advance the FSM.
-
-        Returns the prefix list of tokens that are accepted by the FSM.
-        """
-        if self._is_terminated:
-            return []
-
-        accepted_tokens = []
-        for token in tokens:
-            if self.matcher.accept_token(token):
-                accepted_tokens.append(token)
-                if self.matcher.is_terminated():
-                    break
-            else:
-                break
-        if len(accepted_tokens) > 0:
-            # Rollback the FSM to the initial state
-            self.matcher.rollback(len(accepted_tokens))
-        return accepted_tokens
 
     def rollback(self, num_tokens: int) -> None:
         self.matcher.rollback(num_tokens)

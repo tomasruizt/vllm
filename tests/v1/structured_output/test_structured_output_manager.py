@@ -34,7 +34,7 @@ def tokenizer():
 
 @dataclass(frozen=True)
 class FlowCase:
-    """One validate -> bitmask -> accept -> post-accept bitmask scenario."""
+    """One bitmask -> accept -> post-accept bitmask scenario."""
 
     raw_drafts: tuple[str, ...]
     expected_row_pattern: str
@@ -43,7 +43,6 @@ class FlowCase:
     prefix: str = ""
     expected_validated: tuple[str, ...] | None = None
     reasoning_ended: bool | None = False
-    xfail_guidance: str | None = None
 
 
 class MockReasoner:
@@ -157,10 +156,7 @@ def _run_real_flow(
 ) -> None:
     assert len(expected_validated) <= len(raw_drafts)
 
-    validated = manager.validate_tokens(request, list(raw_drafts))
-    assert validated == expected_validated
-
-    padded = validated + [-1] * (len(raw_drafts) - len(validated))
+    padded = expected_validated + [-1] * (len(raw_drafts) - len(expected_validated))
     bitmask = manager.grammar_bitmask(
         requests={request.request_id: request},
         structured_output_request_ids=[request.request_id],
@@ -169,9 +165,6 @@ def _run_real_flow(
     assert bitmask is not None
     assert bitmask.shape[0] == len(raw_drafts) + 1
     assert _row_pattern(bitmask) == expected_row_pattern
-
-    # grammar_bitmask() must rollback any speculative state it advanced.
-    assert manager.validate_tokens(request, list(raw_drafts)) == expected_validated
 
     structured_req = request.structured_output_request
     assert structured_req is not None
@@ -255,10 +248,6 @@ FLOW_CASES = [
             expected_reasoning=True,
             expect_terminated=True,
             reasoning_ended=True,
-            xfail_guidance=(
-                "guidance validate_tokens rejects EOS on an already-complete "
-                "object even though accept_tokens would accept it"
-            ),
         ),
         id="active_first_token_terminates",
     ),
@@ -341,9 +330,6 @@ def test_real_flow(
     backend: StructuredOutputsBackend,
     case: FlowCase,
 ):
-    if backend == "guidance" and case.xfail_guidance:
-        pytest.xfail(case.xfail_guidance)
-
     reasoner_kwargs = {"marker": _single_token(tokenizer, THINK_END)}
     manager, request = _build_harness(
         tokenizer,
@@ -400,17 +386,14 @@ def test_initial_constraint_activation(
         },
     )
 
-    # "{" is valid JSON start; "z" is not. Truncation proves grammar is active.
     open_brace = _single_token(tokenizer, "{")
-    z = _single_token(tokenizer, "z")
-    assert manager.validate_tokens(request, [open_brace, z]) == [open_brace]
-
     bitmask = manager.grammar_bitmask(
         requests={request.request_id: request},
         structured_output_request_ids=[request.request_id],
         scheduled_spec_decode_tokens={},
     )
     assert bitmask is not None
+    assert _row_pattern(bitmask) == "C"
     request.append_output_token_ids([open_brace])
     assert manager.accept_tokens(request, [open_brace])
 
@@ -511,6 +494,6 @@ def test_outlines_termination(tokenizer):
     grammar.rollback(2)
     assert not grammar.is_terminated()
     assert grammar.num_processed_tokens == 0
-    assert grammar.validate_tokens([eos]) == []
+    assert not grammar.accept_tokens(request.request_id, [eos])
     assert grammar.accept_tokens(request.request_id, [one, eos, one])
     assert grammar.is_terminated()

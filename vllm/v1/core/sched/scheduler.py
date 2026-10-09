@@ -2014,14 +2014,7 @@ class Scheduler(SchedulerInterface):
             structured_output_request_ids,
             scheduler_output.scheduled_spec_decode_tokens,
         )
-        spec_tokens = scheduler_output.scheduled_spec_decode_tokens
-        num_acceptable_drafts = [
-            len(strip_speculative_padding(spec_tokens.get(req_id, [])))
-            for req_id in structured_output_request_ids
-        ]
-        return GrammarOutput(
-            structured_output_request_ids, bitmask, num_acceptable_drafts
-        )
+        return GrammarOutput(structured_output_request_ids, bitmask)
 
     def update_from_output(
         self,
@@ -2564,8 +2557,10 @@ class Scheduler(SchedulerInterface):
                 continue
 
             # Add newly generated spec token ids to the request.
-            request.spec_token_ids = self.structured_output_manager.validate_tokens(
-                request, spec_token_ids
+            request.spec_token_ids = (
+                strip_speculative_padding(spec_token_ids)
+                if request.use_structured_output
+                else spec_token_ids
             )
 
     def update_draft_token_ids_in_output(
@@ -2591,10 +2586,9 @@ class Scheduler(SchedulerInterface):
             # Trim drafts to scheduled number of spec tokens
             # (needed for chunked prefill case for example).
             del spec_token_ids[orig_num_spec_tokens:]
-            # Filter out spec tokens which do not adhere to the grammar.
-            spec_token_ids = self.structured_output_manager.validate_tokens(
-                request, spec_token_ids
-            )
+            # Preserve real drafts; rejection sampling handles grammar violations.
+            if request.use_structured_output:
+                spec_token_ids = strip_speculative_padding(spec_token_ids)
             # Pad to original number of spec tokens.
             num_invalid_tokens = orig_num_spec_tokens - len(spec_token_ids)
             if num_invalid_tokens:
