@@ -201,7 +201,7 @@ class GuidanceGrammar(StructuredOutputGrammar):
         Returns True if the parser was advanced successfully.
         Returns False if the parser failed to advance.
         """
-        # Consuming a forbidden draft irreversibly errors the matcher.
+        # Validate before consuming: a forbidden token errors the matcher.
         if not self.ll_matcher.is_stopped() and self.ll_matcher.validate_tokens(
             tokens
         ) != len(tokens):
