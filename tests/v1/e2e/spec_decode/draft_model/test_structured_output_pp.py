@@ -27,8 +27,8 @@ def case_to_test(pp_size: int, tp_size: int) -> ArgsTest:
         num_speculative_tokens=15,
         method="dflash",
         # reference for AL and AR is TP=1 PP=1
-        expected_acceptance_rate=0.0937 * 0.95,  # ref - 5% tolerance
-        expected_acceptance_len=2.2445 * 0.95,  # ref - 5% tolerance
+        expected_acceptance_rate=0.1009 * 0.95,  # ref - 5% tolerance
+        expected_acceptance_len=2.3457 * 0.95,  # ref - 5% tolerance
         pipeline_parallel_size=pp_size,
         target_tensor_parallel_size=tp_size,
         async_scheduling=True,  # force PP + async scheduling
@@ -53,7 +53,7 @@ def case_to_test(pp_size: int, tp_size: int) -> ArgsTest:
 )
 def test_specdec_pp_structured_output(args: ArgsTest, vllm_runner) -> None:
     messages, sampling_params = _create_requests(
-        args.sampling_config, num_reqs=32, num_structured=16
+        args.sampling_config, num_reqs=100, num_structured=50
     )
     kwargs = vllm_runner_kwargs(args)
     with vllm_runner(args.target_model, **kwargs) as runner:
