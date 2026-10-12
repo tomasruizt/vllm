@@ -55,6 +55,13 @@ class DraftTokensHandler:
         self.req_ids: list[str] = []
         self.draft_tokens_np: np.ndarray | None = None
         self.num_draft_tokens: int = 0
+        # PP batches overlap, so the latest batch may not contain the requests
+        # whose deferred grammar sampling is consuming proposals.
+        self.draft_tokens_by_req: dict[str, np.ndarray] = {}
+
+    def remove_request(self, req_id: str) -> None:
+        self.draft_tokens_by_req.pop(req_id, None)
+        self.req_ids = [current for current in self.req_ids if current != req_id]
 
     def set_draft_tokens(
         self, input_batch: InputBatch, draft_tokens: torch.Tensor
@@ -78,11 +85,15 @@ class DraftTokensHandler:
             # memory before the async copy executes.
             draft_tokens.record_stream(self.copy_stream)
             self.copy_event.record()
+        self.draft_tokens_by_req.update(zip(self.req_ids, self.draft_tokens_np))
 
     def get_draft_tokens(self) -> DraftTokenIds | None:
-        if self.draft_tokens_np is not None:
+        if self.draft_tokens_by_req:
             self.copy_event.synchronize()
-            draft_token_ids = self.draft_tokens_np.tolist()
+            return DraftTokenIds(
+                list(self.draft_tokens_by_req),
+                [tokens.tolist() for tokens in self.draft_tokens_by_req.values()],
+            )
         else:
             # This case only happens when async scheduling is disabled.
             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
