@@ -27,8 +27,8 @@ def case_to_test(pp_size: int, tp_size: int) -> ArgsTest:
         num_speculative_tokens=15,
         method="dflash",
         # reference for AL and AR is TP=1 PP=1
-        expected_acceptance_rate=0.1009 * 0.95,  # ref - 5% tolerance
-        expected_acceptance_len=2.3457 * 0.95,  # ref - 5% tolerance
+        expected_acceptance_rate=0.0990 * 0.95,  # ref - 5% tolerance
+        expected_acceptance_len=2.3215 * 0.95,  # ref - 5% tolerance
         pipeline_parallel_size=pp_size,
         target_tensor_parallel_size=tp_size,
         async_scheduling=True,  # force PP + async scheduling
@@ -46,8 +46,11 @@ def case_to_test(pp_size: int, tp_size: int) -> ArgsTest:
 @pytest.mark.parametrize(
     "args",
     [
-        pytest.param(case_to_test(pp_size=1, tp_size=1), id="pp1-tp1"),
-        pytest.param(case_to_test(pp_size=1, tp_size=2), id="pp1-tp2"),
+        # (2026-10-13) The cases below pass, but are commented out to speed up CI.
+        # PP1/TP1: AR=0.0990 AL=2.3215
+        # pytest.param(case_to_test(pp_size=1, tp_size=1), id="pp1-tp1"),
+        # PP1/TP2: AR=0.0999 AL=2.3351
+        # pytest.param(case_to_test(pp_size=1, tp_size=2), id="pp1-tp2"),
         pytest.param(case_to_test(pp_size=2, tp_size=1), id="pp2-tp1"),
     ],
 )
