@@ -1135,10 +1135,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Call model_state.remove_request *before* req_states.remove_request
         # so the model_state can still look up the slot index.
         self.model_state.remove_request(req_id)
+        self.draft_tokens_handler.remove_request(req_id)
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
-        self.draft_tokens_handler.remove_request(req_id)
         if self.pooling_runner is not None:
             self.pooling_runner.remove_request(req_idx)
         if self.pp_handler is not None:

@@ -19,13 +19,32 @@ def test_overlapping_batches_preserve_drafts_until_request_removal() -> None:
 
     # A newer plain batch must not erase a pending structured batch's drafts.
     _add_draft_toks(handler, req_id="plain", tokens=[31, 32], structured=False)
-    assert _get_draft_toks(handler) == {"first": [11, 12], "second": [21, 22]}
+    assert _get_draft_toks(handler) == {
+        "first": [11, 12],
+        "second": [21, 22],
+        "plain": [-1, -1],
+    }
 
     _add_draft_toks(handler, req_id="first", tokens=[13, 14], structured=True)
     assert _get_draft_toks(handler) == {"first": [13, 14], "second": [21, 22]}
     handler.remove_request(req_id="first")
     assert _get_draft_toks(handler) == {"second": [21, 22]}
     handler.remove_request(req_id="second")
+    assert _get_draft_toks(handler) == {}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_request_removed_before_retrieval_can_reuse_id() -> None:
+    handler = DraftTokensHandler(torch.device("cuda"))
+    _add_draft_toks(handler, req_id="reused", tokens=[11, 12], structured=True)
+    handler.remove_request(req_id="reused")
+    assert _get_draft_toks(handler) == {}
+
+    _add_draft_toks(handler, req_id="reused", tokens=[21, 22], structured=False)
+    assert _get_draft_toks(handler) == {"reused": [-1, -1]}
+    _add_draft_toks(handler, req_id="reused", tokens=[31, 32], structured=True)
+    assert _get_draft_toks(handler) == {"reused": [31, 32]}
+    handler.remove_request(req_id="reused")
     assert _get_draft_toks(handler) == {}
 
 

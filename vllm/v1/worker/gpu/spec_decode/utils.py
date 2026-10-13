@@ -53,7 +53,6 @@ class DraftTokensHandler:
         self.copy_event = torch.cuda.Event(blocking=True)
 
         self.req_ids: list[str] = []
-        self.draft_tokens_np: np.ndarray | None = None
         self.num_draft_tokens: int = 0
         # PP batches overlap, so the latest batch may not contain the requests
         # whose deferred grammar sampling is consuming proposals.
@@ -71,7 +70,6 @@ class DraftTokensHandler:
         if not input_batch.has_structured_output_reqs:
             # No draft token validation needs to be performed by
             # the scheduler for this batch.
-            self.draft_tokens_np = None
             return
 
         # For spec decoding + structured outputs, we must transfer the
@@ -79,25 +77,27 @@ class DraftTokensHandler:
         current_stream = torch.cuda.current_stream(self.device)
         self.copy_stream.wait_stream(current_stream)
         with torch.cuda.stream(self.copy_stream):
-            self.draft_tokens_np = async_copy_to_np(draft_tokens)
+            draft_tokens_np = async_copy_to_np(draft_tokens)
             # draft_tokens is a temporary allocation on the main stream and read here on
             # copy_stream; without record_stream, the caching allocator may reuse its
             # memory before the async copy executes.
             draft_tokens.record_stream(self.copy_stream)
             self.copy_event.record()
-        self.draft_tokens_by_req.update(zip(self.req_ids, self.draft_tokens_np))
+        self.draft_tokens_by_req.update(zip(self.req_ids, draft_tokens_np))
 
     def get_draft_tokens(self) -> DraftTokenIds | None:
         if self.draft_tokens_by_req:
             self.copy_event.synchronize()
-            return DraftTokenIds(
-                list(self.draft_tokens_by_req),
-                [tokens.tolist() for tokens in self.draft_tokens_by_req.values()],
-            )
-        else:
-            # This case only happens when async scheduling is disabled.
-            draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
-        return DraftTokenIds(self.req_ids, draft_token_ids)
+        req_ids = list(self.draft_tokens_by_req)
+        draft_token_ids = [
+            tokens.tolist() for tokens in self.draft_tokens_by_req.values()
+        ]
+        # Current-batch requests without copied drafts still need placeholders.
+        for req_id in self.req_ids:
+            if req_id not in self.draft_tokens_by_req:
+                req_ids.append(req_id)
+                draft_token_ids.append([-1] * self.num_draft_tokens)
+        return DraftTokenIds(req_ids, draft_token_ids)
 
 
 def get_parallel_drafting_token_id(hf_config) -> int:
