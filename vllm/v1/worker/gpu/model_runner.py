@@ -1853,6 +1853,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         self.kv_cache_config.num_blocks,
                         self.max_model_len,
                         input_block_tables=block_tables,
+                        mamba_group_ids=[
+                            i
+                            for i, groups in enumerate(self.attn_groups)
+                            if any(
+                                isinstance(g.kv_cache_spec, MambaSpec) for g in groups
+                            )
+                        ],
                     )
 
         if self.dcp_size > 1 and not (dummy_run and skip_attn_for_dummy_run):

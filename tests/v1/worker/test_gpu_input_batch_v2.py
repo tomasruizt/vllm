@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests for the V2 model runner's InputBatch (vllm.v1.worker.gpu.input_batch)."""
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
@@ -12,9 +14,47 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.worker.gpu import cp_utils
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, set_dummy_context
 
 DEVICE = current_platform.device_type
+
+
+@pytest.mark.parametrize("query_len", [1, 2, 8])
+@pytest.mark.parametrize("num_kv_blocks", [5, 64])
+@pytest.mark.parametrize("context_len", [1024, 16384])
+def test_dummy_context_keeps_mamba_verification_states_non_null(
+    query_len: int, num_kv_blocks: int, context_len: int
+):
+    """Multi-token verification must execute recurrent work instead of skipping it."""
+    num_reqs = 3
+    buffers = InputBuffers(num_reqs, num_reqs * query_len, torch.device("cpu"))
+    batch = InputBatch.make_dummy(num_reqs, num_reqs * query_len, buffers)
+    attention_table = torch.zeros(num_reqs, 256, dtype=torch.int32)
+    state_table = torch.zeros(num_reqs, 16, dtype=torch.int32)
+    block_tables = SimpleNamespace(
+        input_block_tables=(attention_table, state_table),
+        kernel_block_sizes=(128, 16384),
+        blocks_per_kv_block=(1, 1),
+    )
+    set_dummy_context(
+        batch,
+        block_tables,
+        context_len,
+        num_kv_blocks,
+        max_model_len=32768,
+        mamba_group_ids=(1,),
+    )
+
+    # Aligned mode gathers states after the context's block offset.
+    first_column = (context_len + query_len - 1) // 16384
+    states = state_table[:, first_column : first_column + query_len]
+    accepted = batch.query_start_loc.diff().long()
+    sources = states.gather(1, accepted[:, None] - 1)
+    assert torch.all(sources > 0)
+    assert torch.all((states > 0) & (states < num_kv_blocks))
+    if num_kv_blocks == 64:
+        assert states.unique().numel() == states.numel()
+    assert attention_table[0, 0] == 0
 
 
 @pytest.mark.parametrize(

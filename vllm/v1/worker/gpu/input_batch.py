@@ -227,6 +227,7 @@ def set_dummy_context(
     num_kv_blocks: int,
     max_model_len: int,
     input_block_tables: Sequence[torch.Tensor] | None = None,
+    mamba_group_ids: Sequence[int] = (),
 ) -> None:
     """Give each dummy request context_len of context, used when profiling step cost."""
     if input_block_tables is None:
@@ -252,17 +253,31 @@ def set_dummy_context(
     input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
 
     seq_len = context_len + query_len
-    for block_table, block_size, bpk in zip(
-        input_block_tables,
-        block_tables.kernel_block_sizes,
-        block_tables.blocks_per_kv_block,
+    for group_id, (block_table, block_size, bpk) in enumerate(
+        zip(
+            input_block_tables,
+            block_tables.kernel_block_sizes,
+            block_tables.blocks_per_kv_block,
+        )
     ):
         num_blocks = min(cdiv(seq_len, block_size), block_table.shape[1])
-        # Spans are disjoint until the pool runs out, then they wrap and share
-        # blocks: profiling only needs the reads to be realistic, not distinct.
+        first_block = 0
+        if group_id in mamba_group_ids:
+            # Recurrent verification reads the accepted state and writes one
+            # state per query token. Block 0 is the null state.
+            num_blocks = min(
+                num_blocks + int(input_batch.num_scheduled_tokens.max()) - 1,
+                block_table.shape[1],
+            )
+            first_block = 1
+            if num_kv_blocks <= 1:
+                raise ValueError("Dummy Mamba context requires a non-null state block")
+        # Dummy contexts reuse blocks when the batch exceeds the pool capacity.
         block_ids = torch.arange(
             num_reqs * num_blocks, dtype=block_table.dtype, device=block_table.device
-        ) % (num_kv_blocks * bpk)
+        )
+        block_ids %= num_kv_blocks * bpk - first_block
+        block_ids += first_block
         block_table[:num_reqs, :num_blocks] = block_ids.view(num_reqs, num_blocks)
 
 
