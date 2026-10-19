@@ -207,6 +207,9 @@ class AdaptiveVerificationManager:
                 yield {
                     "num_tokens": num_tokens,
                     "context_len": envs.VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN,
+                    "profile_mixed": num_tokens
+                    > self.req_states.max_num_reqs
+                    * (self.num_speculative_steps + self.num_bonus_tokens),
                 }
 
     def set_initial_cost_curves(self, samples: list[StepTimingSample]) -> None:

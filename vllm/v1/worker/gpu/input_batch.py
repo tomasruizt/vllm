@@ -131,6 +131,8 @@ class InputBatch:
         input_buffers: InputBuffers,
         max_query_len: int | None = None,
         is_padding: bool = True,
+        num_scheduled_tokens: np.ndarray | None = None,
+        decode_query_len: int | None = None,
     ) -> "InputBatch":
         assert 0 < num_reqs <= num_tokens
         device = input_buffers.device
@@ -145,17 +147,22 @@ class InputBatch:
         # ceil(num_tokens / num_reqs) <= max_model_len tokens. Varlen graphs
         # accept any split with non-empty slots, so this shape works for them
         # too; attention metadata is built from the promised max_query_len.
-        base_tokens = num_tokens // num_reqs
-        num_extra = num_tokens % num_reqs
-        assert max_query_len is None or base_tokens + (num_extra > 0) <= max_query_len
-        num_scheduled_tokens = np.full(num_reqs, base_tokens, dtype=np.int32)
-        if num_extra > 0:
-            num_scheduled_tokens[-num_extra:] += 1
-        assert int(num_scheduled_tokens.sum()) == num_tokens
-
-        # seq_len equals to query_len
-        input_buffers.seq_lens[: num_reqs - num_extra] = base_tokens
-        input_buffers.seq_lens[num_reqs - num_extra : num_reqs] = base_tokens + 1
+        if num_scheduled_tokens is None:
+            base_tokens = num_tokens // num_reqs
+            num_extra = num_tokens % num_reqs
+            num_scheduled_tokens = np.full(num_reqs, base_tokens, dtype=np.int32)
+            if num_extra > 0:
+                num_scheduled_tokens[-num_extra:] += 1
+            input_buffers.seq_lens[: num_reqs - num_extra] = base_tokens
+            input_buffers.seq_lens[num_reqs - num_extra : num_reqs] = base_tokens + 1
+        else:
+            num_scheduled_tokens = num_scheduled_tokens.astype(np.int32, copy=True)
+            assert num_scheduled_tokens.shape == (num_reqs,)
+            assert num_scheduled_tokens.min() > 0
+            input_buffers.seq_lens[:num_reqs] = torch.from_numpy(num_scheduled_tokens)
+        assert max_query_len is None or num_scheduled_tokens.max() <= max_query_len
+        actual_num_tokens = int(num_scheduled_tokens.sum())
+        assert actual_num_tokens <= num_tokens
         # Pad for full CUDA graph mode.
         input_buffers.seq_lens[num_reqs:] = 0
         seq_lens = input_buffers.seq_lens[:num_reqs]
@@ -168,13 +175,14 @@ class InputBatch:
             seq_lens, dim=0, out=input_buffers.query_start_loc[1 : num_reqs + 1]
         )
         # Pad for full CUDA graph mode.
-        input_buffers.query_start_loc[num_reqs + 1 :] = num_tokens
+        input_buffers.query_start_loc[num_reqs + 1 :] = actual_num_tokens
         query_start_loc = input_buffers.query_start_loc[: num_reqs + 1]
 
         input_ids = input_buffers.input_ids[:num_tokens].zero_()
         positions = input_buffers.positions[:num_tokens].zero_()
 
         input_buffers.is_padding[:num_tokens].fill_(is_padding)
+        input_buffers.is_padding[actual_num_tokens:num_tokens] = True
         is_padding = input_buffers.is_padding[:num_tokens]
 
         logits_indices = query_start_loc[1:] - 1
@@ -183,6 +191,13 @@ class InputBatch:
         # Copy so set_dummy_context can add context in place without touching
         # num_scheduled_tokens.
         seq_lens_cpu_upper_bound = torch.from_numpy(num_scheduled_tokens.copy())
+        is_prefilling = np.zeros(num_reqs, dtype=np.bool_)
+        num_draft_tokens_per_req = None
+        if decode_query_len is not None:
+            is_prefilling = num_scheduled_tokens > decode_query_len
+            num_draft_tokens_per_req = np.where(
+                is_prefilling, 0, num_scheduled_tokens - 1
+            ).astype(np.int32)
         return cls(
             req_ids=req_ids,
             num_reqs=num_reqs,
@@ -192,22 +207,26 @@ class InputBatch:
             expanded_idx_mapping=expanded_idx_mapping,
             expanded_local_pos=expanded_local_pos,
             num_scheduled_tokens=num_scheduled_tokens,
-            num_tokens=num_tokens,
+            num_tokens=actual_num_tokens,
             num_tokens_after_padding=num_tokens,
-            num_draft_tokens=0,
-            num_draft_tokens_per_req=None,
+            num_draft_tokens=(
+                0
+                if num_draft_tokens_per_req is None
+                else int(num_draft_tokens_per_req.sum())
+            ),
+            num_draft_tokens_per_req=num_draft_tokens_per_req,
             query_start_loc=query_start_loc,
             query_start_loc_np=query_start_loc_np,
             seq_lens=seq_lens,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             dcp_local_seq_lens=None,
             num_computed_tokens_np=np.zeros(num_reqs, dtype=np.int32),
-            prefill_len_np=np.zeros(num_reqs, dtype=np.int32),
+            prefill_len_np=np.where(is_prefilling, num_scheduled_tokens, 0),
             num_computed_prefill_tokens_np=np.zeros(num_reqs, dtype=np.int32),
-            is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
-            has_prefill=False,
+            is_prefilling_np=is_prefilling,
+            has_prefill=bool(is_prefilling.any()),
             max_seq_len_np=None,
-            decode_graph_eligible=True,
+            decode_graph_eligible=not bool(is_prefilling.any()),
             input_ids=input_ids,
             positions=positions,
             is_padding=is_padding,
@@ -218,6 +237,30 @@ class InputBatch:
             prompt_lens=None,
             max_query_len=max_query_len,
         )
+
+
+def get_dummy_query_lengths(
+    num_tokens: int,
+    num_reqs: int,
+    decode_query_len: int | None = None,
+    prefill_chunk_len: int = 0,
+) -> list[int]:
+    """Keep decode rows within their bound and fill the surplus with prefills."""
+    decode_lengths: list[int] = []
+    if decode_query_len is not None and num_tokens > num_reqs * decode_query_len:
+        chunk_len = max(
+            prefill_chunk_len, decode_query_len + 1, cdiv(num_tokens, num_reqs)
+        )
+        surplus = num_tokens - num_reqs * decode_query_len
+        num_prefills = min(num_reqs, cdiv(surplus, chunk_len - decode_query_len))
+        num_decodes = num_reqs - num_prefills
+        decode_lengths = [decode_query_len] * num_decodes
+        num_tokens -= num_decodes * decode_query_len
+        num_reqs = num_prefills
+    return decode_lengths + [
+        num_tokens // num_reqs + (i >= num_reqs - num_tokens % num_reqs)
+        for i in range(num_reqs)
+    ]
 
 
 def set_dummy_context(
@@ -236,23 +279,24 @@ def set_dummy_context(
         # Attention-free models have no KV context to fabricate.
         return
     num_reqs = input_batch.num_reqs
-    query_len = input_batch.max_query_len or int(input_batch.num_scheduled_tokens.max())
-    context_len = max(min(context_len, max_model_len - query_len), 0)
-    if not context_len:
-        return
+    query_lens = input_batch.max_query_len or input_batch.num_scheduled_tokens
+    context_lens = np.minimum(context_len, max_model_len - query_lens).clip(min=0)
+    context_lens = np.where(input_batch.is_prefilling_np, 0, context_lens)
+    context_tensor = torch.from_numpy(context_lens)
 
     # Decode-like shape: each request continues after context_len
     # already-computed tokens.
-    input_batch.seq_lens += context_len
-    input_batch.seq_lens_cpu_upper_bound += context_len
-    input_batch.num_computed_tokens_np.fill(context_len)
-    input_batch.num_computed_prefill_tokens_np.fill(context_len)
+    input_batch.seq_lens += context_tensor.to(input_batch.seq_lens.device)
+    input_batch.seq_lens_cpu_upper_bound += context_tensor
+    input_batch.num_computed_tokens_np[:] = context_lens
+    input_batch.num_computed_prefill_tokens_np[:] = context_lens
     local_pos = np.arange(input_batch.num_tokens, dtype=np.int64) - np.repeat(
         input_batch.query_start_loc_np[:-1], input_batch.num_scheduled_tokens
     )
-    input_batch.positions.copy_(torch.from_numpy(local_pos + context_len))
+    positions = local_pos + np.repeat(context_lens, input_batch.num_scheduled_tokens)
+    input_batch.positions[: input_batch.num_tokens].copy_(torch.from_numpy(positions))
 
-    seq_len = context_len + query_len
+    seq_len = int(input_batch.seq_lens_cpu_upper_bound.max())
     for group_id, (block_table, block_size, bpk) in enumerate(
         zip(
             input_block_tables,

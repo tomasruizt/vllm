@@ -14,9 +14,72 @@ from vllm.model_executor.layers.fused_moe.router.fused_topk_router import fused_
 from vllm.platforms import current_platform
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.worker.gpu import cp_utils
-from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers, set_dummy_context
+from vllm.v1.worker.gpu.input_batch import (
+    InputBatch,
+    InputBuffers,
+    get_dummy_query_lengths,
+    set_dummy_context,
+)
 
 DEVICE = current_platform.device_type
+
+
+@pytest.mark.parametrize(
+    "tokens,requests,decode_width,chunk_len",
+    [
+        (8192, 512, 8, 1024),
+        (16384, 512, 8, 1024),
+        (1025, 128, 8, 8192),
+        (100, 1, 3, 32),
+        (17, 4, 1, 0),
+        (200, 8, 16, 32),
+    ],
+)
+def test_dummy_tail_reserves_request_slots_for_prefill(
+    tokens: int, requests: int, decode_width: int, chunk_len: int
+):
+    lengths = get_dummy_query_lengths(tokens, requests, decode_width, chunk_len)
+    assert sum(lengths) == tokens
+    assert len(lengths) == requests
+    assert min(lengths) >= decode_width
+    prefills = [n for n in lengths if n > decode_width]
+    assert prefills
+    assert max(prefills) - min(prefills) <= 1
+    assert lengths == sorted(lengths)
+
+
+def test_dummy_mixed_batch_preserves_prefill_context_and_graph_padding():
+    buffers = InputBuffers(4, 16, torch.device("cpu"))
+    batch = InputBatch.make_dummy(
+        3,
+        16,
+        buffers,
+        is_padding=False,
+        num_scheduled_tokens=np.array([2, 2, 9]),
+        decode_query_len=2,
+    )
+    tables = SimpleNamespace(
+        input_block_tables=(torch.zeros(3, 16, dtype=torch.int32),),
+        kernel_block_sizes=(2,),
+        blocks_per_kv_block=(1,),
+    )
+    set_dummy_context(batch, tables, context_len=8, num_kv_blocks=128, max_model_len=32)
+
+    assert batch.num_tokens == 13
+    assert batch.num_tokens_after_padding == 16
+    assert batch.has_prefill and not batch.decode_graph_eligible
+    np.testing.assert_array_equal(batch.is_prefilling_np, [False, False, True])
+    np.testing.assert_array_equal(batch.num_computed_prefill_tokens_np, [8, 8, 0])
+    torch.testing.assert_close(
+        batch.query_start_loc, torch.tensor([0, 2, 4, 13], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        batch.seq_lens, torch.tensor([10, 10, 9], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        batch.positions[:13], torch.tensor([8, 9, 8, 9, *range(9)])
+    )
+    assert batch.is_padding.tolist() == [False] * 13 + [True] * 3
 
 
 @pytest.mark.parametrize("query_len", [1, 2, 8])

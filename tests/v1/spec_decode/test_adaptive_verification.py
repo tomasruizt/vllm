@@ -184,6 +184,18 @@ def test_budget_stops_where_marginal_drafts_stop_paying_for_themselves():
     assert num_non_draft_tokens == {"low": 1, "high": 1}
 
 
+@pytest.mark.parametrize("num_speculative_steps", [0, 2, 7, 15])
+def test_profiled_batches_above_decode_capacity_are_mixed(num_speculative_steps):
+    manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
+    manager.req_states = SimpleNamespace(max_num_batched_tokens=128, max_num_reqs=3)
+    manager.num_speculative_steps = num_speculative_steps
+    manager.num_bonus_tokens = 1
+    for batch in manager.batches_to_profile([4, 16, 32]):
+        assert batch["profile_mixed"] == (
+            batch["num_tokens"] > 3 * (num_speculative_steps + 1)
+        )
+
+
 def test_profiled_batches_seed_cost_curves_via_consumer(monkeypatch):
     manager = AdaptiveVerificationManager.__new__(AdaptiveVerificationManager)
     manager.req_states = SimpleNamespace(max_num_batched_tokens=4096, max_num_reqs=64)

@@ -115,6 +115,7 @@ from vllm.v1.worker.gpu.input_batch import (
     InputBuffers,
     combine_sampled_and_draft_tokens,
     expand_idx_mapping,
+    get_dummy_query_lengths,
     post_update,
     post_update_num_computed_tokens,
     prepare_pos_seq_lens,
@@ -802,6 +803,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn: bool = False,
         uniform_decode: bool = False,
         context_len: int = 0,
+        profile_mixed: bool = False,
         skip_eplb: bool = False,
         is_profile: bool = False,
         valid_dummy_state_slots: bool = False,
@@ -837,13 +839,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 - num_reqs * self.speculator.num_extra_query_per_req,
             )
 
-        # Distribute the remainder evenly so no dummy request exceeds
-        # ceil(num_tokens / num_reqs) <= max_model_len tokens.
-
-        num_tokens_per_request = [
-            num_tokens // num_reqs + (i >= num_reqs - num_tokens % num_reqs)
-            for i in range(num_reqs)
-        ]
+        dummy_decode_query_len = self.decode_query_len if profile_mixed else None
+        if profile_mixed:
+            num_tokens = min(num_tokens, num_reqs * self.max_model_len)
+        num_tokens_per_request = get_dummy_query_lengths(
+            num_tokens,
+            num_reqs,
+            dummy_decode_query_len,
+            prefill_chunk_len=min(context_len, self.max_model_len),
+        )
 
         assert sum(num_tokens_per_request) == num_tokens
         num_scheduled_tokens = {
@@ -878,6 +882,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_attn_for_dummy_run=skip_attn,
                 is_profile=is_profile,
                 context_len=context_len,
+                dummy_decode_query_len=dummy_decode_query_len,
                 valid_dummy_state_slots=valid_dummy_state_slots,
                 randomize_inputs=randomize_inputs,
             )
@@ -1571,7 +1576,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             for block_table in block_tables:
                 block_table[:, 0].copy_(state_slots)
         slot_mappings = block_table_provider.get_dummy_slot_mappings(
-            input_batch.num_tokens
+            input_batch.num_tokens_after_padding
         )
         return block_tables, slot_mappings
 
@@ -1710,6 +1715,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         skip_attn_for_dummy_run: bool = False,
         is_profile: bool = False,
         context_len: int = 0,
+        dummy_decode_query_len: int | None = None,
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
@@ -1740,6 +1746,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         batch_req_state, uniform_tok_count = self.gather_batch_req_state(
             scheduler_output, dummy_run
         )
+        if dummy_run and dummy_decode_query_len is not None:
+            # Mixed profiling batches must not replay decode-only FULL graphs.
+            max_query_len = None
+            uniform_tok_count = None
         if batch_req_state is not None:
             num_toks = batch_req_state.num_tokens
             if batch_req_state.has_prefill:
@@ -1821,6 +1831,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         else:
             # No actual tokens to run. A dummy run for DP or memory profiling.
             dummy_num_reqs = batch_desc.num_reqs or num_reqs
+            dummy_split = None
+            if dummy_decode_query_len is not None:
+                assert dummy_num_reqs == num_reqs
+                dummy_split = np.fromiter(
+                    scheduler_output.num_scheduled_tokens.values(),
+                    dtype=np.int32,
+                    count=num_reqs,
+                )
             input_batch = InputBatch.make_dummy(
                 dummy_num_reqs,
                 batch_desc.num_tokens,
@@ -1829,6 +1847,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 # Profiling and warmup must route the dummy tokens to experts
                 # so MoE memory is measured and MoE kernels are exercised.
                 is_padding=not is_profile,
+                num_scheduled_tokens=dummy_split,
+                decode_query_len=dummy_decode_query_len,
             )
             if randomize_inputs:
                 # All-zero input_ids route every token to the same experts.
@@ -1845,7 +1865,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 block_tables, slot_mappings = self.prepare_dummy_attn(
                     input_batch, valid_dummy_state_slots
                 )
-                if context_len:
+                if context_len or dummy_decode_query_len is not None:
                     set_dummy_context(
                         input_batch,
                         self.block_tables,
