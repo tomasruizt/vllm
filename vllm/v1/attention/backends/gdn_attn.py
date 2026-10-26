@@ -28,7 +28,7 @@ from vllm.v1.attention.backends.utils import (
     mamba_get_block_table_tensor,
     split_decodes_and_prefills,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
 # FlashInfer's GDN prefill emits states every N tokens, N a multiple of its
 # 64-token chunk, so checkpoint offsets must be multiples of 64.
@@ -144,16 +144,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
     def get_varlen_cudagraph_max_query_len(
         cls,
         vllm_config: VllmConfig,
-        kv_cache_spec: MambaSpec,
+        kv_cache_spec: KVCacheSpec,
     ) -> int | None:
-        del kv_cache_spec
-        from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-            MAX_FUSED_GDN_MTP_TOKENS,
-        )
-
-        return min(
-            max_decode_query_len(vllm_config), MAX_FUSED_GDN_MTP_TOKENS
-        )
+        return max_decode_query_len(vllm_config)
 
     reorder_batch_threshold: int = 1
 
