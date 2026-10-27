@@ -191,6 +191,8 @@ class SpecDecodeMetrics:
     num_draft_tokens: int
     num_accepted_tokens: int
     accepted_per_pos: dict[int, int]
+    # Only exported with adaptive verification.
+    num_verified_tokens: int | None = None
 
 
 async def fetch_spec_decode_metrics(
@@ -211,6 +213,7 @@ async def fetch_spec_decode_metrics(
             num_draft_tokens = 0
             num_accepted_tokens = 0
             accepted_per_pos: dict[int, int] = {}
+            num_verified_tokens: int | None = None
             found_spec_decode = False
 
             for line in text.split("\n"):
@@ -243,6 +246,10 @@ async def fetch_spec_decode_metrics(
                                 )
                         elif "num_accepted_tokens" in metric_name:
                             num_accepted_tokens += int(float(parts[-1]))
+                        elif metric_name.endswith("num_verified_draft_tokens_total"):
+                            num_verified_tokens = (num_verified_tokens or 0) + int(
+                                float(parts[-1])
+                            )
 
             if not found_spec_decode:
                 return None
@@ -252,6 +259,7 @@ async def fetch_spec_decode_metrics(
                 num_draft_tokens=num_draft_tokens,
                 num_accepted_tokens=num_accepted_tokens,
                 accepted_per_pos=accepted_per_pos,
+                num_verified_tokens=num_verified_tokens,
             )
     except (aiohttp.ClientError, asyncio.TimeoutError):
         return None
@@ -1130,6 +1138,10 @@ async def benchmark(
                 "acceptance_length": acceptance_length,
                 "per_position_acceptance_rates": per_pos_rates,
             }
+            verified_before = spec_decode_metrics_before.num_verified_tokens
+            verified_after = spec_decode_metrics_after.num_verified_tokens
+            if verified_before is not None and verified_after is not None:
+                spec_decode_stats["verified_tokens"] = verified_after - verified_before
 
     diffusion_metrics_after = await fetch_diffusion_metrics(base_url, session)
     diffusion_stats: dict[str, Any] | None = None
@@ -1343,6 +1355,8 @@ async def benchmark(
         result["spec_decode_per_position_acceptance_rates"] = spec_decode_stats.get(
             "per_position_acceptance_rates", []
         )
+        if "verified_tokens" in spec_decode_stats:
+            result["spec_decode_verified_tokens"] = spec_decode_stats["verified_tokens"]
 
     if diffusion_stats is not None:
         result["diffusion_committed_throughput"] = diffusion_stats[
@@ -1448,6 +1462,12 @@ async def benchmark(
                 "Accepted tokens:", int(spec_decode_stats["accepted_tokens"])
             )
         )
+        if "verified_tokens" in spec_decode_stats:
+            print(
+                "{:<40} {:<10}".format(
+                    "Verified tokens:", spec_decode_stats["verified_tokens"]
+                )
+            )
         per_pos = spec_decode_stats.get("per_position_acceptance_rates", [])
         if per_pos:
             print("Per-position acceptance (%):")

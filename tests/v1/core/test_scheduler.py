@@ -1979,7 +1979,7 @@ def test_schedule_spec_decoding_stats(
 
 @pytest.mark.parametrize(
     "request_state",
-    ["active", "grammar_invalid", "finished_removed", "finished_retained"],
+    ["active", "finished_removed", "finished_retained"],
 )
 def test_adaptive_verification_stats_count_actual_budget(request_state):
     scheduler = create_scheduler(
@@ -1999,11 +1999,7 @@ def test_adaptive_verification_stats_count_actual_budget(request_state):
     )
     scheduler.update_draft_token_ids(DraftTokenIds([req_id], [[1, 2, 3, 4, 5]]))
     output = scheduler.schedule()
-    if request_state == "grammar_invalid":
-        # Async grammar validation happens after scheduling; invalid draft
-        # positions can still be sent to the verifier.
-        output.num_invalid_spec_tokens = {req_id: 2}
-    elif request_state == "finished_removed":
+    if request_state == "finished_removed":
         scheduler.finish_requests(req_id, RequestStatus.FINISHED_STOPPED)
     elif request_state == "finished_retained":
         request.status = RequestStatus.FINISHED_STOPPED
@@ -2020,9 +2016,6 @@ def test_adaptive_verification_stats_count_actual_budget(request_state):
     stats = engine_outputs[0].scheduler_stats.spec_decoding_stats
     if request_state == "active":
         assert stats.num_draft_tokens == 5
-        assert stats.num_verified_draft_tokens == 4
-    elif request_state == "grammar_invalid":
-        assert stats.num_draft_tokens == 3
         assert stats.num_verified_draft_tokens == 4
     else:
         assert stats is None
@@ -2044,13 +2037,11 @@ def test_per_request_spec_decode_omits_verified_without_adaptive_verification():
     assert "per_step_verified" not in payload
 
 
-def _run_spec_verify_steps(scheduler, rounds, num_invalid_per_round=None):
+def _run_spec_verify_steps(scheduler, rounds):
     """Drive prefill + one draft/verify step per round for a single request.
 
     ``rounds`` is a list of ``(spec_token_ids, output_token_ids)`` -- one verify
-    step each. ``num_invalid_per_round`` optionally injects the grammar-invalid
-    draft count structured-output decoding would set on the verify output.
-    Returns the request.
+    step each. Returns the request.
     """
     [req] = create_requests(num_requests=1, num_tokens=1)
     scheduler.add_request(req)
@@ -2069,11 +2060,9 @@ def _run_spec_verify_steps(scheduler, rounds, num_invalid_per_round=None):
 
     # Prefill: sample one token.
     scheduler.update_from_output(scheduler.schedule(), _mk_output([[0]]))
-    for i, (spec, out) in enumerate(rounds):
+    for spec, out in rounds:
         scheduler.update_draft_token_ids(DraftTokenIds([rid], [spec]))
         output = scheduler.schedule()
-        if num_invalid_per_round is not None and num_invalid_per_round[i]:
-            output.num_invalid_spec_tokens = {rid: num_invalid_per_round[i]}
         scheduler.update_from_output(output, _mk_output([out]))
     return req
 
@@ -2099,23 +2088,51 @@ def test_per_request_spec_decode_detailed_records_per_step():
     assert payload["num_spec_steps"] == 3
 
 
-def test_per_request_spec_decode_subtracts_invalid_drafts():
-    # Grammar-invalidated drafts (num_invalid_spec_tokens, set by structured
-    # output) are excluded from the proposed count, mirroring the aggregate.
+class _PrefixGrammar:
+    def __init__(self, num_valid: int) -> None:
+        self.num_valid = num_valid
+
+    def validate_tokens(self, tokens: list[int]) -> list[int]:
+        return tokens[: self.num_valid]
+
+    def accept_tokens(self, request_id: str, tokens: list[int]) -> bool:
+        return True
+
+    def is_terminated(self) -> bool:
+        return False
+
+
+@pytest.mark.parametrize("num_valid", [2, 0])
+def test_spec_decode_counts_grammar_invalid_drafts_as_proposed(num_valid: int):
+    # Sync scheduling trims grammar-invalid drafts before scheduling. They still
+    # count as drafted, while the ngram -1 padding does not.
     scheduler = create_scheduler(
-        num_speculative_tokens=3,
-        per_request_spec_decode_metrics="summary",
+        num_speculative_tokens=4, per_request_spec_decode_metrics="summary"
     )
-    # One verify step: 3 drafted, 1 grammar-invalid, output accepts 2.
-    req = _run_spec_verify_steps(
-        scheduler,
-        [([1, 2, 3], [1, 2, 5])],
-        num_invalid_per_round=[1],
+    request = _decode_ready_request(scheduler)
+    req_id = request.request_id
+    request.structured_output_request = SimpleNamespace(
+        grammar=_PrefixGrammar(num_valid), reasoning_ended=True
     )
-    payload = scheduler.requests[req.request_id].spec_decode_metrics.to_dict()
-    assert payload["num_draft_tokens"] == 2  # 3 drafted - 1 invalid
-    assert payload["num_accepted_draft_tokens"] == 2  # len([1,2,5]) - 1
-    assert payload["acceptance_histogram"] == [0, 0, 1, 0]
+    scheduler.update_draft_token_ids(DraftTokenIds([req_id], [[1, 2, 3, -1]]))
+    output = scheduler.schedule()
+    assert output.scheduled_spec_decode_tokens.get(req_id, []) == [1, 2][:num_valid]
+    accepted_and_bonus = [*range(1, num_valid + 1), 9]
+    engine_outputs = scheduler.update_from_output(
+        output,
+        ModelRunnerOutput(
+            req_ids=[req_id],
+            req_id_to_index={req_id: 0},
+            sampled_token_ids=[accepted_and_bonus],
+        ),
+    )
+
+    stats = engine_outputs[0].scheduler_stats.spec_decoding_stats
+    assert stats.num_draft_tokens == 3
+    assert stats.num_accepted_tokens == num_valid
+    payload = request.spec_decode_metrics.to_dict()
+    assert payload["num_draft_tokens"] == 3
+    assert payload["num_spec_steps"] == 1
 
 
 def test_per_request_spec_decode_acceptance_disabled_by_default():
@@ -7344,7 +7361,8 @@ def test_update_draft_token_ids_in_output_strips_padding():
         -1,
         -1,
     ]
-    assert scheduler_output.num_invalid_spec_tokens == {request.request_id: 2}
+    # The -1 padding is not counted as proposed.
+    assert scheduler_output.num_proposed_spec_tokens == {request.request_id: 2}
 
 
 def test_diffusion_canvas_width_defaults_to_the_served_canvas():

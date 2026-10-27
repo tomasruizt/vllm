@@ -65,7 +65,7 @@ A `summary` response's `metrics` looks like:
 | `acceptance_histogram` | Dense list of length `num_spec_tokens + 1`; index `j` is the number of steps that accepted exactly `j` draft tokens. Excludes the always-accepted bonus token. |
 | `num_spec_steps` | Number of verification steps for this request (the sum of the histogram). |
 | `num_accepted_draft_tokens` | Total accepted draft tokens, excluding bonus tokens. |
-| `num_draft_tokens` | Total proposed draft tokens, after subtracting drafts invalidated by structured-output constraints. |
+| `num_draft_tokens` | Total draft tokens proposed by the draft model, including tokens that are invalid given a grammar and tokens dropped by adaptive verification. |
 | `num_spec_tokens` | Configured `num_speculative_tokens` (`k`), i.e. the maximum draft length per step. |
 
 With `detailed`, two ordered arrays are added, one entry per verification step:
@@ -111,8 +111,3 @@ verified draft width can be estimated by dividing the verified draft tokens by t
 
 The per-position counter `vllm:spec_decode_num_verified_draft_tokens_per_pos_total`
 uses a zero-based `position` label and sums to the scalar verified count.
-
-With async scheduling and structured outputs, grammar-invalid draft positions may
-still be sent to the target verifier. These positions are excluded from
-`num_draft_tokens` but included in the verified counter, so the verified count
-can exceed `num_draft_tokens`.
