@@ -828,14 +828,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         num_accepted_tokens = torch.diff(m.query_start_loc)
-        if self._adaptive_verification:
-            # Replay may turn captured one-token requests into fewer multi-token requests,
-            # so adaptive verification must capture the speculative path.
-            num_decode_draft_tokens_cpu = torch.full_like(
-                torch.diff(m.query_start_loc_cpu), self.num_spec
-            )
-        else:
-            num_decode_draft_tokens_cpu = torch.diff(m.query_start_loc_cpu).sub_(1)
+        num_decode_draft_tokens_cpu = torch.diff(m.query_start_loc_cpu).sub_(1)
         assert num_decode_draft_tokens_cpu.shape == num_accepted_tokens.shape
 
         return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
