@@ -89,7 +89,12 @@ constexpr int kWarps = kThreads / 32;
 constexpr int kChunkV = 32;
 constexpr int kNumChunks = kDimV / kChunkV;
 constexpr int kRowsPerWarp = kChunkV / kWarps;
-constexpr int kMaxMtpTokens = 8;
+// 9 = DSpark's published ceiling (block_size=8, anchor-sampling) + vLLM's
+// generic spec-decode bonus-token slot. Shared memory is static (no
+// cudaFuncSetAttribute opt-in), so this is capped by the compiler's 48KB
+// per-block limit together with shared_state below, not by the GPU's
+// per-SM maximum: fp32 recurrent state leaves only ~2.4KB of headroom here.
+constexpr int kMaxMtpTokens = 9;
 constexpr int kDtBiasFloat32 = 0;
 constexpr int kDtBiasBFloat16 = 1;
 constexpr int kDtBiasFloat16 = 2;

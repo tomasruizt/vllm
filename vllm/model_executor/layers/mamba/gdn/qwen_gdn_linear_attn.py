@@ -103,7 +103,9 @@ if GDN_AITER_TRITON_AVAILABLE:
 
 logger = init_logger(__name__)
 
-MAX_FUSED_GDN_MTP_TOKENS = 8
+MAX_FUSED_GDN_MTP_TOKENS = (
+    9  # kMaxMtpTokens in fused_gdn_decode_kernel.cu; keep in sync
+)
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
