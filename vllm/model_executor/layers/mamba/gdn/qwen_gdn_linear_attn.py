@@ -5,7 +5,7 @@
 import functools
 import itertools
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from typing import Literal
 
@@ -61,6 +61,7 @@ from vllm.model_executor.layers.utils import cuda_unquantized_gemm
 from vllm.model_executor.model_loader.weight_utils import (
     sharded_weight_loader,
 )
+from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.third_party.flash_linear_attention.ops import (
@@ -599,6 +600,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         self.key_dim = self.head_k_dim * self.num_k_heads
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.gqa_interleaved_layout = gqa_interleaved_layout
+        self.fuse_ba_proj = (
+            current_platform.is_cuda()
+            and not gqa_interleaved_layout
+            and config.model_type in ("qwen3_5_text", "qwen3_5_moe_text")
+            and self.quant_config is None
+            and vllm_config.lora_config is None
+            and self.model_config.dtype == torch.bfloat16
+        )
         self.gdn_xpu_backend: str | None = None
         self.qkvz_layout = "interleaved" if gqa_interleaved_layout else "flat"
         if current_platform.is_xpu():
@@ -644,18 +653,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ba_proj doesn't support blockwise fp8 quantization.
         # Qwen3-Next and Qwen3.5 have different in_proj_ba checkpoint
         # layouts, so we use a factory method to create the projection.
-        self.in_proj_ba = self.create_ba_proj(
-            hidden_size=self.hidden_size,
-            num_v_heads=self.num_v_heads,
-            quant_config=self.quant_config,
-            prefix=f"{prefix}.in_proj_ba",
-        )
+        if not self.fuse_ba_proj:
+            self.in_proj_ba = self.create_ba_proj(
+                hidden_size=self.hidden_size,
+                num_v_heads=self.num_v_heads,
+                quant_config=self.quant_config,
+                prefix=f"{prefix}.in_proj_ba",
+            )
         self.disable_tp_for_ba_proj = self.maybe_disable_tp(self.quant_config)
         # Opt-in, for callers outside torch.compile (compiled callers would need a
         # custom op or Dynamo stream tracing; not validated). Plain cuBLAS ba GEMM only:
         # FlashInfer GEMMs share a process-wide workspace. Off with ubatching and LoRA.
         self._ba_stream = None
-        ba_method = self.in_proj_ba.quant_method
+        ba_method = None if self.fuse_ba_proj else self.in_proj_ba.quant_method
         if (
             overlap_ba_proj
             and current_platform.is_cuda()
@@ -845,6 +855,34 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             return "torch.ops._C.fused_gdn_decode_post_conv_mtp is not built"
         return None
 
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        if self.fuse_ba_proj:
+            weights = self._remap_fused_projection_weights(weights)
+        return AutoWeightsLoader(self).load_weights(weights)
+
+    def _remap_fused_projection_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[tuple[str, torch.Tensor]]:
+        for name, weight in weights:
+            if name.startswith("in_proj_ba."):
+                shards: tuple[int, ...] = (4, 5)
+            elif name.startswith("in_proj_qkvz."):
+                shards = tuple(range(6))
+            else:
+                yield name, weight
+                continue
+            shard_id = getattr(weight, "shard_id", None)
+            if shard_id is not None:
+                ids = (shard_id,) if isinstance(shard_id, int) else shard_id
+                shards = tuple(shards[i] for i in ids)
+            elif len(shards) == 6 and weight.shape[0] != self.in_proj_qkvz.output_size:
+                shards = shards[:4]
+            sizes = [self.in_proj_qkvz.output_sizes[i] for i in shards]
+            name = name.replace("in_proj_ba.", "in_proj_qkvz.", 1)
+            for i, part in zip(shards, weight.split(sizes, dim=0)):
+                part.shard_id = i
+                yield name, part
+
     def create_qkvz_proj(
         self,
         hidden_size: int,
@@ -863,6 +901,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             if self.gqa_interleaved_layout
             else [key_dim, key_dim, value_dim, value_dim]
         )
+        if self.fuse_ba_proj:
+            output_sizes += [self.num_v_heads, self.num_v_heads]
         return MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=output_sizes,
@@ -1187,31 +1227,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         3. Output projection
 
         ``qkvz_input``, if given, is ``hidden_states`` pre-quantized for
-        in_proj_qkvz; in_proj_ba still reads ``hidden_states``.
+        in_proj_qkvz; unfused in_proj_ba still reads ``hidden_states``.
         """
         num_tokens = hidden_states.size(0)
         # ============================================================
         # Part 1: Input Projection
         # ============================================================
-        qkvz_in = hidden_states if qkvz_input is None else qkvz_input
-        if self._ba_stream is None:
-            mixed_qkvz, _ = self.in_proj_qkvz(qkvz_in)
-            ba, _ = self.in_proj_ba(hidden_states)
-        else:
-            # Hide the tiny ba GEMM on the aux stream. Only under CUDA graph
-            # capture: eagerly the stream switch costs more host time than it
-            # saves. ba is enqueued first (aux-first order); qkvz-first
-            # regressed block-FP8 qkvz from ~100 tokens.
-            start, done = self._ba_events
-            mixed_qkvz, (ba,) = execute_in_parallel(
-                lambda: self.in_proj_qkvz(qkvz_in)[0],
-                [lambda: self.in_proj_ba(hidden_states)[0]],
-                start,
-                [done],
-                [self._ba_stream],
-                enable=num_tokens <= _BA_PROJ_OVERLAP_MAX_TOKENS
-                and torch.cuda.is_current_stream_capturing(),
-            )
+        mixed_qkvz, ba = self._input_projection(hidden_states, qkvz_input)
 
         use_fused_gdn_spec_decode = (
             self.enable_fused_gdn_spec_decode
@@ -1299,6 +1321,39 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # Part 3: Output Projection
         # ============================================================
         return self._output_projection(core_attn_out, z)
+
+    def _input_projection(
+        self,
+        hidden_states: torch.Tensor,
+        qkvz_input: QuantizedActivation | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.fuse_ba_proj:
+            projected, _ = self.in_proj_qkvz(hidden_states)
+            qkvz_size = (2 * self.key_dim + 2 * self.value_dim) // self.tp_size
+            ba_size = 2 * self.num_v_heads // self.tp_size
+            return projected.split([qkvz_size, ba_size], dim=-1)
+
+        qkvz_in = hidden_states if qkvz_input is None else qkvz_input
+        if self._ba_stream is None:
+            mixed_qkvz, _ = self.in_proj_qkvz(qkvz_in)
+            ba, _ = self.in_proj_ba(hidden_states)
+            return mixed_qkvz, ba
+
+        # Hide the tiny ba GEMM on the aux stream. Only under CUDA graph
+        # capture: eagerly the stream switch costs more host time than it
+        # saves. ba is enqueued first (aux-first order); qkvz-first
+        # regressed block-FP8 qkvz from ~100 tokens.
+        start, done = self._ba_events
+        mixed_qkvz, (ba,) = execute_in_parallel(
+            lambda: self.in_proj_qkvz(qkvz_in)[0],
+            [lambda: self.in_proj_ba(hidden_states)[0]],
+            start,
+            [done],
+            [self._ba_stream],
+            enable=hidden_states.size(0) <= _BA_PROJ_OVERLAP_MAX_TOKENS
+            and torch.cuda.is_current_stream_capturing(),
+        )
+        return mixed_qkvz, ba
 
     def forward_xpu(
         self,
