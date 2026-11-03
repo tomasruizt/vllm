@@ -90,10 +90,12 @@ constexpr int kChunkV = 32;
 constexpr int kNumChunks = kDimV / kChunkV;
 constexpr int kRowsPerWarp = kChunkV / kWarps;
 // 9 = DSpark's published ceiling (block_size=8, anchor-sampling) + vLLM's
-// generic spec-decode bonus-token slot. Shared memory is static (no
-// cudaFuncSetAttribute opt-in), so this is capped by the compiler's 48KB
-// per-block limit together with shared_state below, not by the GPU's
-// per-SM maximum: fp32 recurrent state leaves only ~2.4KB of headroom here.
+// generic spec-decode bonus-token slot. Can exceed kWarps (one warp handles
+// several tokens via a strided loop below) up to the shared-memory ceiling:
+// shared memory is static (no cudaFuncSetAttribute opt-in), so it is capped
+// by the compiler's 48KB per-block limit together with shared_state below,
+// not by the GPU's per-SM maximum — fp32 recurrent state leaves only ~2.4KB
+// of headroom at 9.
 constexpr int kMaxMtpTokens = 9;
 constexpr int kDtBiasFloat32 = 0;
 constexpr int kDtBiasBFloat16 = 1;
@@ -207,8 +209,12 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
   copy_state_chunk<StateT, kChunkV, kDimK, 2>(&shared_state[0][0][0],
                                               source_state, 0, tid, kThreads);
 
-  if (warp < num_tokens) {
-    const int t = warp;
+  // One warp per token, but kWarps (8) can be smaller than num_tokens (up to
+  // kMaxMtpTokens): stride so e.g. warp 0 also covers token 8. kWarps itself
+  // stays fixed here since it is shared with the state-tiling loop below
+  // (rows[] assumes kChunkV % kWarps == 0), so growing kWarps to cover more
+  // tokens directly would break that instead.
+  for (int t = warp; t < num_tokens; t += kWarps) {
     const int token = bos + t;
     const int64_t mixed_base = static_cast<int64_t>(token) * strides.mixed_row;
     float q_values[4];
@@ -343,8 +349,7 @@ __global__ __launch_bounds__(kThreads, 2) void gdn_decode_post_conv_mtp_kernel(
   }
   __syncthreads();
 
-  if (warp < num_tokens) {
-    const int t = warp;
+  for (int t = warp; t < num_tokens; t += kWarps) {
     float output_values[4];
     float sum_square = 0.0f;
 #pragma unroll
