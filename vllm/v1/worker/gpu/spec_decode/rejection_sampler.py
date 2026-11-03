@@ -275,6 +275,7 @@ class RejectionSampler:
             expanded_local_pos,
             seq_lens_upper_bound_np,
         )
+        temperature_np = self.sampler.sampling_states.temperature.np[idx_mapping_np]
         sampled, num_sampled = rejection_sample(
             processed_logits,
             draft_logits,
@@ -293,6 +294,7 @@ class RejectionSampler:
             fly_window_size=self.fly_window_size,
             fly_entropy_threshold=self.fly_entropy_threshold,
             fly_entropy_top_k=self.fly_entropy_top_k,
+            all_greedy=bool(np.all(temperature_np == 0.0)),
             **self._watermarking_kwargs(
                 draft_sampled, expanded_idx_mapping, expanded_local_pos
             ),
