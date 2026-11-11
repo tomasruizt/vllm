@@ -16,6 +16,7 @@ Scenarios:
 """
 
 import argparse
+import functools
 import gc
 import json
 from dataclasses import dataclass
@@ -24,6 +25,13 @@ from pathlib import Path
 import flashinfer.sampling as fi_sampling
 import pandas as pd
 import torch
+from topk_topp_flashinfer_fastpath import (
+    apply_top_k_top_p_flashinfer,
+    can_apply_top_k_top_p_flashinfer,
+)
+from topk_topp_triton_main import (
+    apply_top_k_top_p_triton as apply_top_k_top_p_triton_main,
+)
 
 from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
 from vllm.v1.sample.ops.topk_topp_triton import (
@@ -44,6 +52,12 @@ class BenchmarkConfig:
     p_values: torch.Tensor | None  # [batch_size] or None
     description: str
     ops_pct: float = 0.0  # Percentage of ops relative to batch size
+    # Host-side (min, max) of k, which the sampler tracks without reading the GPU.
+    top_k_bounds: tuple[int, int] | None = None
+
+    def __post_init__(self):
+        if self.k_values is not None:
+            self.top_k_bounds = (int(self.k_values.min()), int(self.k_values.max()))
 
 
 def calculate_ops_pct(
@@ -115,11 +129,42 @@ def apply_top_k_top_p_flashinfer_mask(logits, k, p):
     return logits
 
 
+def apply_top_k_top_p_fi_naive_renorm(logits, k, p):
+    """FlashInfer's radix top-k renorm, then its top-p renorm, on the softmax.
+    Returns the kept logits, like the other implementations."""
+    probs = logits.softmax(dim=-1)
+    if k is not None:
+        probs = fi_sampling.top_k_renorm_probs(probs, k)
+    if p is not None:
+        probs = fi_sampling.top_p_renorm_probs(probs, p)
+    return logits.masked_fill(probs == 0, -float("inf"))
+
+
+def apply_top_k_top_p_fi_fastpath(logits, k, p, top_k_bounds):
+    """The FlashInfer fast path of #65649: FlashInfer top-k candidates, then a Triton
+    kernel that cuts them at k and p. Batches it does not cover use main's kernel."""
+    if can_apply_top_k_top_p_flashinfer(logits, k, top_k_bounds):
+        return apply_top_k_top_p_flashinfer(logits, k, p, top_k_bounds)
+    return apply_top_k_top_p_triton_main(logits, k, p)
+
+
 IMPLEMENTATIONS = {
     "triton": apply_top_k_top_p_triton,
+    "fi-fastpath": apply_top_k_top_p_fi_fastpath,
+    "triton-main": apply_top_k_top_p_triton_main,
+    "fi-naive-renorm": apply_top_k_top_p_fi_naive_renorm,
     "flashinfer-mask": apply_top_k_top_p_flashinfer_mask,
     "pytorch": apply_top_k_top_p_pytorch,
 }
+
+
+def bind(name: str, config: BenchmarkConfig):
+    """The implementation as a function of (logits, k, p). The fast path also takes
+    the config's host-side bounds of k."""
+    func = IMPLEMENTATIONS[name]
+    if name == "fi-fastpath":
+        return functools.partial(func, top_k_bounds=config.top_k_bounds)
+    return func
 
 
 def measure_memory() -> tuple[int, int]:
@@ -294,7 +339,7 @@ def run_benchmark(
         k, p = config.k_values, config.p_values
         timings = {}
         for name in implementations:
-            func = IMPLEMENTATIONS[name]
+            func = bind(name, config)
             reset_memory_stats()
             times = bench_gpu_time(func, logits, k, p, warmup_iters, benchmark_iters)
             elapsed = sum(times) / len(times)
@@ -346,7 +391,7 @@ def check_implementations(
     reference = apply_top_k_top_p_pytorch(logits.clone(), k, p).softmax(dim=-1)
     checks = {}
     for name in implementations:
-        actual = IMPLEMENTATIONS[name](logits.clone(), k, p).softmax(dim=-1)
+        actual = bind(name, config)(logits.clone(), k, p).softmax(dim=-1)
         total_variation = (actual - reference).abs().sum(-1).max().item() / 2
         checks[name] = {
             "close": torch.allclose(actual, reference, rtol=1e-5, atol=1e-6),
