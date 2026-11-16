@@ -18,6 +18,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.v1.worker.gpu.spec_decode.dspine.config import DSpineSpeculatorConfig
 
+from . import qwen3_dspine_scoring as scoring
 from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
 from .utils import WeightsMapper, maybe_prefix
 
@@ -365,15 +366,17 @@ class DSpineQwen3ForCausalLM(DFlashQwen3ForCausalLM):
         final_pre_injection: torch.Tensor,
         anchor_token_ids: torch.Tensor,
     ) -> torch.Tensor:
-        return _score_transitions(
-            self.model.injection,
-            self.model.norm,
-            self.lm_head,
-            self.model.transfer_codebook,
+        # The target's lm_head replaces the draft's after loading, so the
+        # tables are built on the first (eager, memory-profiling) call.
+        if not hasattr(self, "_dspine_tables"):
+            assert not torch.cuda.is_current_stream_capturing()
+            self._dspine_tables = scoring.build_tables(self)
+        return scoring.score(
+            self,
             candidate_ids,
             final_pre_injection,
             anchor_token_ids,
-            len(self.model.layers) - 1,
+            _score_transitions,
         )
 
 
