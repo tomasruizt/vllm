@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections.abc import Iterable, Iterator
 from typing import Any
 
@@ -29,7 +30,8 @@ from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
 # per vocab block on load and apply ops like temperature and gumbel, so folding
 # sampling-param application into those kernels would remove this buffer and
 # its traffic entirely.
-MAX_CHUNK_BYTES = 2**30  # 1GB
+# Experiment only: AV_TRACE_MAX_CHUNK_BYTES lifts the cap so verify-all is not censored.
+MAX_CHUNK_BYTES = int(os.environ.get("AV_TRACE_MAX_CHUNK_BYTES", 2**30))  # 1GB
 _FP32_BYTES = 4
 
 
