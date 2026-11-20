@@ -10,6 +10,7 @@ is still recorded.
 
 import json
 import os
+import time
 
 import numpy as np
 import torch
@@ -50,6 +51,7 @@ def _emit_step(pending: dict, num_sampled: torch.Tensor) -> None:
     req_ids = pending.pop("req_ids")
     emit(
         "step",
+        t=time.time(),
         **pending,
         req_ids=[req_ids[i] for i in rows],
         scheduled=scheduled[rows].tolist(),
