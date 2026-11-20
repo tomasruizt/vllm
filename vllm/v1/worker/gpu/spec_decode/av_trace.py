@@ -15,6 +15,7 @@ import time
 import numpy as np
 import torch
 
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
 
 TRACE_PATH = os.environ.get("AV_TRACE_PATH")
@@ -24,6 +25,8 @@ _handle = None
 
 def emit(kind: str, **fields: object) -> None:
     global _handle
+    if get_tp_group().rank_in_group != 0:
+        return
     if _handle is None:
         _handle = open(str(TRACE_PATH), "a", buffering=1)  # noqa: SIM115
     _handle.write(json.dumps(dict(kind=kind, **fields), separators=(",", ":")))
