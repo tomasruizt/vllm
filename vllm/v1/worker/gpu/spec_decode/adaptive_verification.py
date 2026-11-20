@@ -23,6 +23,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     get_query_lens_mismatch_unsupported_backend,
     get_varlen_cudagraph_unsupported_backend,
 )
+from vllm.v1.worker.gpu.spec_decode import av_trace
 
 logger = init_logger(__name__)
 _PROFILE_REPLAYS = 5
@@ -288,8 +289,15 @@ class AdaptiveVerificationManager:
         ]
         self._pending_resets: list[int] = []
         self._stale_idx = 0
+        self._trace_step: dict = {}
+        self._trace_pending: dict | None = None
         for slot in self._stale_confidences:
             slot.np.fill(1.0)
+
+    def trace_outcome(self, num_sampled: torch.Tensor) -> None:
+        pending, self._trace_pending = self._trace_pending, None
+        if pending is not None:
+            av_trace.emit_step(pending, num_sampled)
 
     def warmup_budget_kernel(self) -> None:
         """JIT the draft-budget kernel so the first binding step doesn't compile."""
@@ -371,6 +379,8 @@ class AdaptiveVerificationManager:
             self._cudagraph_limit,
         )
         logger.debug("DSpark cost tables: %s", self.cost_tables)
+        if av_trace.TRACE_PATH:
+            av_trace.emit_costs(self.cost_tables)
 
     def record_confidences(
         self, confidence_probs: torch.Tensor, input_batch: "InputBatch"
@@ -463,6 +473,14 @@ class AdaptiveVerificationManager:
         draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
         # Rank-local confidences must not select different TP execution sizes.
         draft_budget = get_tp_group().broadcast_object(draft_budget, src=0)
+        self._trace_step = dict(
+            policy_budget=draft_budget,
+            max_budget=max_draft_budget,
+            num_reqs=num_reqs,
+            non_draft_total=num_non_draft_tokens_total,
+        )
+        if av_trace.VERIFY_ALL:
+            draft_budget = max_draft_budget
         self._batch_budget = (
             num_drafts_per_req,
             num_non_draft_tokens_per_req,
@@ -566,6 +584,15 @@ class AdaptiveVerificationManager:
             out=self.query_start_loc[1 : num_reqs + 1],
         )
         self.query_start_loc[num_reqs + 1 :].fill_(num_tokens)
+
+        if av_trace.TRACE_PATH and not torch.cuda.is_current_stream_capturing():
+            self._trace_pending = dict(
+                self._trace_step,
+                req_ids=list(req_ids),
+                scheduled=scheduled_drafts,
+                probs=self._confidence_probs[idx_mapping].clone(),
+                admitted=capacities.clone(),
+            )
 
         admitted_drafts = None
         if self._copy_admitted_drafts_to_host and (
